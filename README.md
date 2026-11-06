@@ -102,6 +102,28 @@ Skill 的发现路径由 DSH 决定：`<项目根>\.agents\skills`（本仓库�
 Copy-Item -Recurse .agents\skills\manga "$env:USERPROFILE\.agents\skills\manga"
 ```
 
+## 版本管理
+
+按**阶段**推进，**每个阶段至少一次提交**。完整约定见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| **P0** | Skill 骨架 + 薄 CLI（paths/doctor/verify/ingest/convert-cbz/guard）+ 红线守卫 + 45 项测试 | ✅ 已提交 |
+| **P1** | jmcomic 适配层：search / album / comments / download / export / domains / pick-domain | ⏳ |
+| **P2** | 参考表补齐与校准 | ⏳ |
+| **P3** | gallery-dl / mangadex-downloader 适配器 + 长任务模型 + GitHub Actions 生成器 | ⏳ |
+| **P4** | 依赖探测、日志治理、装配与发布 | ⏳ |
+
+提交信息格式：`<类型>(P<阶段号>): <祈使句>`，例如 `feat(P1): jmcomic 适配层 —— 搜索/详情/下载/导出`。
+阶段分支 `p/<阶段号>-<短名>`，squash 合入 `main`，保证 `main` 历史里 **一个阶段 = 一个提交**。
+
+```powershell
+git switch -c p/1-jmcomic-adapter
+# …开发…
+uv run pytest && uv run manga doctor
+git add -A && git commit -m "feat(P1): jmcomic 适配层 —— 搜索/详情/下载/导出"
+```
+
 ## 边界
 
 - 不做 GUI（Web 层如需，另行叠加在 core 之上，估算见评估文档）。
