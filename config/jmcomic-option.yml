@@ -1,0 +1,81 @@
+# ============================================================
+#  jmcomic 配置文件 —— 本机专用（2026-11-06 按实测环境生成）
+#  jmcomic 2.7.11 | uv tool 安装 | C:\Users\muxin\.local\bin
+#
+#  用法：
+#    jmcomic <id...> --option "C:\Users\muxin\Downloads\dsh\manga\jmcomic\option.yml"
+#    或设一次环境变量，之后直接 jmcomic <id...>：
+#      setx JM_OPTION_PATH "C:\Users\muxin\Downloads\dsh\manga\jmcomic\option.yml"
+#
+#  字段全量参考：option.reference.yml（本机 2026-11-06 导出的 option 快照）
+#  官方文档：https://jmcomic.readthedocs.io/zh-cn/latest/
+# ============================================================
+
+version: '2.1'
+log: true
+
+# ── 登录 ────────────────────────────────────────────────────────────
+# 大部分本子无需登录；收藏夹 / 签到 / 敏感题材才需要。
+# 用账号密码（推荐）；想存环境变量就执行：
+#   setx JM_USERNAME "你的账号"
+#   setx JM_PASSWORD "你的密码"
+auth:
+  username: ${JM_USERNAME}
+  password: ${JM_PASSWORD}
+  # 浏览器 cookies（仅 impl: html；cookies 必须来自实际访问的域名）
+  # cookies:
+  #   AVS: <AVS 值>
+
+# ── 客户端 ──────────────────────────────────────────────────────────
+client:
+  impl: api                    # api=APP端（不限 IP、稳定）；html=网页端（效率高但限制 IP 地区）
+  async_impl: null
+  domain: []                   # 留空=自动；域名全挂时见 STEP-BY-STEP 第 1 步
+  retry_times: 5
+  cache: true                  # 元数据缓存，减少重复请求
+  postman:
+    type: curl_cffi
+    meta_data:                 # ★ proxies / impersonate 必须在这一层（写在外层会被静默忽略）
+      headers: null
+      impersonate: chrome
+      # ★ 本机实测：Clash Verge 正在 127.0.0.1:7897 监听，系统代理也指向它
+      #   → 直接写死这个端口最稳；Clash 换了端口/没开时改这里
+      #   写成 system 表示跟随系统代理；写 null 表示不走代理
+      proxies: 127.0.0.1:7897
+
+# ── 下载 ────────────────────────────────────────────────────────────
+download:
+  cache: true                  # 磁盘已有文件不重复下载（断点续传）
+  image:
+    decode: true               # ★ 必须开：还原站点的混淆图，否则下到的是乱码路径
+    suffix: null               # null = 保持原始格式（不重编码，符合本项目「只重打包不重编码」铁律）
+  threading:
+    image: 20                  # 同时下载图片数（站点单次上限 50；网络差就调到 10）
+    photo: 8                   # 同时下载章节数（默认 24 偏激进，8 更稳）
+
+# ── 落盘目录 ────────────────────────────────────────────────────────
+dir_rule:
+  # ★ 官方默认是「当前工作目录」，会把图丢进你当时所在的项目目录
+  #   这里固定到收件箱旁的暂存区：00-Incoming 不参与 Syncthing 共享，安全
+  base_dir: C:/Users/muxin/Documents/Library/00-Incoming/_raw_jmcomic
+  # <本子标题>/<章节名> —— 这样转换脚本能同时拿到系列名与话号
+  #
+  # ⚠ 分隔符与写法必须配套，**不能混用**：
+  #   「/」分隔 → 段内不能带 "Bd_" 前缀（`Bd/Atitle/Pname` ✅，`Bd_Atitle/Pname` ❌ 会生成字面量目录 Bd_Atitle）
+  #   「_」分隔 → 段内不能用 "/"        （`Bd_Atitle_Pname` ✅）
+  #   f-string 写法必须用「/」分隔     （`Bd / {Atitle} / {Pname}` ✅）
+  # 2026-11-06 实测修正：原值 `Bd_Atitle/Pname` 会把首段当成字面量目录名，
+  #   导致 Convert-JmComicToCbz.ps1 把所有章节误归到名为 "Bd_Atitle" 的系列下。
+  rule: Bd/Atitle/Pname
+  normalize_zh: null           # 繁简统一：zh-cn / zh-tw / null
+
+# ── 插件 ────────────────────────────────────────────────────────────
+plugins:
+  dependencies_strategy: failed-fast
+  valid: log
+  after_init:
+    - plugin: advanced_retry   # 域名多轮轮询 + 单域名失败上限，站点抽风时救命
+      kwargs:
+        retry_config:
+          retry_rounds: 3
+          retry_domain_max_times: 5

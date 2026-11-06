@@ -1,0 +1,32 @@
+[project]
+name = "manga-collector"
+version = "0.1.0"
+description = "漫画采集聚合层：Agent Skill + 薄 CLI（Skill 是界面，CLI 是手，agent 是大脑）"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "jmcomic>=2.7.11",
+    "rich>=15.0.0",
+    "typer>=0.28.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+manga = "manga.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/manga"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# 沙箱内 %TEMP% 不可写：pytest 的临时目录必须落在工作区内，并关闭会写临时目录的 cacheprovider
+addopts = "-q -p no:cacheprovider"

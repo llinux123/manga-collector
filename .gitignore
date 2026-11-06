@@ -1,0 +1,35 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# ── 工具缓存 / 测试临时目录（%TEMP% 在部分环境不可写，必须落在工作区内）──
+.uv-cache/
+.pytest-tmp/
+.test-tmp/
+.pytest-cache/
+# 早前 tempfile.mkdtemp 留下的残骸（Windows 下 0o700 会套受限权限，需管理员权限删除）
+pytest-of-*/
+pytest-cache-files-*/
+tk-*/
+
+# ── 运行日志（jmcomic 会把日志固定写在「当前工作目录」，下完记得清理）──
+*.log
+jmcomic-download.log
+
+# ── 本机私有 ──
+# 导出共享区的快照（红线守卫用）
+.export-snapshot.json
+
+# ── Node ──
+node_modules/
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
