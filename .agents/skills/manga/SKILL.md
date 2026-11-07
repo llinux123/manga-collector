@@ -7,7 +7,7 @@ description: >
   或要把下载件变成一话一包 + ComicInfo.xml 的收藏库；或要检查漫画库质量。
   不做：不装第三方扩展；不替用户索要密码或 Cookie；不把灰色来源导出到手机同步区；
   不做 OCR/翻译/超分（另有独立 skill）。
-version: 0.1.0
+version: 0.2.0
 metadata:
   project: manga
   repo: https://github.com/hect0x7/JMComic-Crawler-Python
@@ -28,12 +28,16 @@ CLI 把所有确定性动作（跑脚本、解析退出码、守红线）做掉�
 
 | 用户说 | 你做什么 |
 |---|---|
-| 「下载 JM 404005」 | 先 `manga doctor` 确认环境 → 确认下载计划 → `manga download`（P1 起可用；当前用 `jmcomic` 命令，见 §6） |
+| 「下载 JM 404005」 | `manga doctor` 确认环境 → `manga download 404005`（**dry-run**，报章节数/图片数）→ 用户确认 → `manga download 404005 --apply` → §7 的入库三步 |
+| 「搜个本子 / 找 XX 的图」 | `manga search "关键词" --mode site\|tag\|author\|work\|actor` |
+| 「这本是啥 / 有几话」 | `manga album 404005` |
+| 「看看评论区」 | `manga comments 404005` |
+| 「导出成 zip / pdf / 长图」 | `manga export 404005 --format zip\|pdf\|longimg`（落点受红线约束） |
 | 「把这个本子入库」 | `manga convert-cbz --apply` → `manga ingest --apply` → `manga verify` |
 | 「检查一下库」 | `manga verify` |
 | 「看看下载到哪了 / 收件箱里有什么」 | `manga paths` 看落点，再列目录 |
-| 「导出到手机」 | **先问来源等级**：白/绿来源才 `manga export`；灰色来源**直接拒绝**（§5） |
-| 「哪些域名能访问」 | `manga pick-domain`（P1 起可用；当前用 `jmcomic` 的 `pick_domain` 脚本） |
+| 「导出到手机」 | **先问来源等级**：白/绿来源才导出到共享区；灰色来源**直接拒绝**（§5） |
+| 「哪些域名能访问 / 下载报重试耗尽」 | `manga pick-domain`（挑最快的）→ `manga domains`（看池子） |
 | 「导出收藏夹 / 签到」 | `manga favorites` / `manga checkin`（P3 起可用） |
 | 「帮我配一下」 | 读 [references/option-and-plugins.md](references/option-and-plugins.md) 再改本仓库的 `config/jmcomic-option.yml` |
 | 「收藏夹命名 / 文件夹怎么排」 | 读 [references/naming.md](references/naming.md) |
@@ -46,14 +50,25 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 | 命令 | 作用 | 写操作 |
 |---|---|---|
 | `manga paths` | 打印所有解析后的路径（收件箱/权威库/共享区/脚本目录） | 否 |
-| `manga doctor` | 环境体检：PowerShell、脚本、jmcomic、**代理端口**、目录 | 否 |
+| `manga doctor` | 环境体检：PowerShell、脚本、jmcomic、**代理端口**、目录、工作区 | 否 |
+| `manga search` | 禁漫搜索（site/tag/author/work/actor 五维） | 否 |
+| `manga album` | 本子详情（含章节列表） | 否 |
+| `manga comments` | 本子评论（含回评树） | 否 |
+| `manga domains` | 当前域名池（API 静态池 + 网页端域名） | 否 |
+| `manga pick-domain` | 并发探测域名池，列出最快的可用域名 | 否 |
+| `manga download` | 下载本子/章节到暂存区 | **默认 dry-run**，要 `--apply` |
+| `manga export` | 导出 ZIP / PDF / 长图（走 jmcomic Feature） | 是 |
 | `manga verify` | 只读校验权威库（命名/元数据/可读率/编号一致性/重复） | 否 |
 | `manga ingest` | 入库整理：重命名 + 写 ComicInfo.xml + 移入权威库 | **默认 dry-run**，要 `--apply` |
 | `manga convert-cbz` | jmcomic 散图 → `<编号> - <标题>.cbz`（图片平铺包根） | **默认 dry-run**，要 `--apply` |
 | `manga guard` | 红线守卫：查看/快照/比对共享区 `Export\Manga` | 只读（写快照文件除外） |
 
 常用参数：`--library-root`（书库根，默认 `%USERPROFILE%\Documents\Library`）、
-`--scripts-dir`（脚本目录）、`--report-path`（校验报告 CSV）、`--top-n`（问题条数）。
+`--scripts-dir`（脚本目录）、`--report-path`（校验报告 CSV）、`--top-n`（问题条数）、
+`--dest`（下载/导出落点，默认 `00-Incoming\_raw_jmcomic`）、`--impl api|html`。
+
+**落点红线**：`manga download` / `manga export` 的落点若落在
+`Export\Manga`（共享区）或 `Manga\Library`（权威库）→ **退出码 6**，这是代码强制的，改参数绕不过去。
 
 ## 3. 输出契约（必须遵守）
 
@@ -88,36 +103,36 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 ## 5. 红线（最高优先级，不可绕过）
 
 1. **灰色来源（禁漫等未授权成人漫画扫描件）的产物不得进入 `Export\Manga`** —— 那是 Syncthing 共享区，
-   会同步到手机。CLI 里没有对灰色来源的导出能力，`manga guard` 会检测共享区新增文件并以退出码 6 拒绝。
-2. **不替用户分发、不做批量分发、不把灰色内容写进共享库。**
-3. **不把 `Manga\Library` 设为 Syncthing 共享目录**（只共享 `Export\Manga`）。
-4. 触发红线时：说明**哪个对象**越界、**为什么**，然后**停下**，不要换个命令再试一次。
+   会同步到手机。`manga download` / `manga export` 的落点若指向共享区，**CLI 直接以退出码 6 拒绝**
+   （代码强制，改参数绕不过去）；`manga guard` 会检测共享区新增文件并同样拒绝。
+2. **下载器不得直写 `Manga\Library`** —— 那是权威库，必须经 `ingest` 的校验闸门。CLI 同样拒绝（退出码 6）。
+3. **不替用户分发、不做批量分发、不把灰色内容写进共享库。**
+4. **不把 `Manga\Library` 设为 Syncthing 共享目录**（只共享 `Export\Manga`）。
+5. 触发红线时：说明**哪个对象**越界、**为什么**，然后**停下**，不要换个命令再试一次。
 
 ## 6. 降级路径（CLI 还没覆盖的能力）
 
-当前版本 CLI 只覆盖入库与校验侧。下列能力**直接用原生命令**，但仍然守上面的红线：
+禁漫侧（搜索/详情/评论/下载/导出/域名）已由 CLI 覆盖。下列能力**直接用原生命令**，但仍然守上面的红线：
 
 ```powershell
-# 下载（禁漫）—— 用 manga 工作区里的 option（实机那份）
-jmv 404005 -y --option "C:\Users\muxin\Downloads\dsh\manga\jmcomic\option.yml"      # 先看详情，不下载
-jmcomic 404005 --option "C:\Users\muxin\Downloads\dsh\manga\jmcomic\option.yml"      # 下载
-jmcomic 404005 --dry-run --option "C:\Users\muxin\Downloads\dsh\manga\jmcomic\option.yml"   # 干跑（注意：会忽略 --option）
-
-# 通用站 / 图源（gallery-dl）
+# 通用站 / 图源（gallery-dl）—— P3 起由 CLI 封装
 gallery-dl --cbz -d "$env:USERPROFILE\Documents\Library\00-Incoming\Manga" "<URL>"
 
-# MangaDex
+# MangaDex —— P3 起由 CLI 封装
 mangadex-dl --save-as cbz --path "$env:USERPROFILE\Documents\Library\00-Incoming\Manga" "<URL>"
 ```
 
 **所有下载器的落点统一是 `00-Incoming\Manga`，产物必须是一话一个 `.cbz`**（入库脚本只吃 cbz）。
 下载完成后回到 §1 的「入库」三步。
 
+> 禁漫走 `manga download`，落点是 `00-Incoming\_raw_jmcomic`（**不是** `00-Incoming\Manga`）——
+> 散图先在暂存区，打包成 CBZ 后才进收件箱。
+
 ## 7. 写操作确认
 
-`ingest` / `convert-cbz` **默认 dry-run**。流程固定：
+`download` / `ingest` / `convert-cbz` **默认 dry-run**。流程固定：
 
-1. 先跑**不带 `--apply`** 的版本，把计划（要改什么、跳过什么、冲突什么）转述给用户；
+1. 先跑**不带 `--apply`** 的版本，把计划（要下什么、要改什么、跳过什么、冲突什么）转述给用户；
 2. 用户确认后再加 `--apply` 跑一次；
 3. 跑 `manga verify` 确认退出码 0。
 

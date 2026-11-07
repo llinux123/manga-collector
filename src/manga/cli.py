@@ -21,6 +21,7 @@ from typing import Any
 import typer
 
 from . import __version__
+from .adapters import jmcomic as jm_adapter
 from .adapters import pipeline
 from .config import ENV_WORKSPACE, Paths, resolve_paths
 from .envelope import (
@@ -345,6 +346,201 @@ def guard(
         return Envelope(ok=True, data=data, warnings=warnings)
 
     _run("guard", run)
+
+
+# ── jmcomic 采集命令（P1） ────────────────────────────────────────────────
+
+
+def _jm_option(p: Paths, *, dest: Path | None = None):
+    """按 option 文件构造 JmOption。
+
+    落点由 CLI 决定（option 文件只提供 client/download 行为），
+    红线目录（共享区 / 权威库）在构造阶段就被拒。
+    """
+    return jm_adapter.build_option(
+        p.option_file,
+        dest=dest,
+        export_dir=p.export,
+        library_dir=p.library,
+    )
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="关键词（+包含 -排除，空格=AND）"),
+    mode: str = typer.Option("site", "--mode", help="site|tag|author|work|actor"),
+    page: int = typer.Option(1, "--page", help="页码"),
+    limit: int = typer.Option(20, "--limit", help="最多返回条数"),
+    impl: str | None = typer.Option(None, "--impl", help="api|html（默认取 option）"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """禁漫搜索（五个维度）。"""
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        option = _jm_option(p)
+        data = jm_adapter.search(option, query, mode=mode, page=page, limit=limit, impl=impl)
+        return Envelope(ok=True, data=data)
+
+    _run("search", run)
+
+
+@app.command()
+def album(
+    album_id: str = typer.Argument(..., help="本子 ID（禁漫车号）"),
+    impl: str | None = typer.Option(None, "--impl"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """本子详情（含章节列表）。"""
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        option = _jm_option(p)
+        data = jm_adapter.album_detail(option, album_id, impl=impl)
+        return Envelope(ok=True, data=data)
+
+    _run("album", run)
+
+
+@app.command()
+def comments(
+    album_id: str = typer.Argument(..., help="本子 ID"),
+    page: int = typer.Option(1, "--page"),
+    limit: int = typer.Option(50, "--limit"),
+    impl: str | None = typer.Option(None, "--impl"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """本子评论（含回评树）。"""
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        option = _jm_option(p)
+        data = jm_adapter.comments(option, album_id, page=page, limit=limit, impl=impl)
+        return Envelope(ok=True, data=data)
+
+    _run("comments", run)
+
+
+@app.command()
+def download(
+    ids: list[str] = typer.Argument(..., help="本子 ID（可多个）"),
+    dest: str | None = typer.Option(None, "--dest", help="落点（默认 <library-root>\\00-Incoming\\_raw_jmcomic）"),
+    photo: bool = typer.Option(False, "--photo", help="ID 是章节 ID 而非本子 ID"),
+    apply: bool = typer.Option(False, "--apply", help="真正下载；不加就是 dry-run（只解析章节数）"),
+    login: bool = typer.Option(True, "--login/--no-login", help="是否用 option 里的账号自动登录"),
+    impl: str | None = typer.Option(None, "--impl"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """下载本子/章节到暂存区。
+
+    **默认 dry-run**（只报章节数与图片数）；加 ``--apply`` 才真正下载。
+    落点不得是共享区（``Export\\Manga``）或权威库（``Manga\\Library``）——违反即退出码 6。
+    """
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        target = Path(dest) if dest else p.raw_jmcomic
+        option = _jm_option(p, dest=target)
+        data = jm_adapter.download(
+            option,
+            ids,
+            dest=target,
+            export_dir=p.export,
+            library_dir=p.library,
+            photo=photo,
+            dry_run=not apply,
+            login=login,
+            impl=impl,
+        )
+        warnings = [] if apply else ["dry-run：未加 --apply，未下载任何图片"]
+        return Envelope(ok=True, data=data, warnings=warnings)
+
+    _run("download", run)
+
+
+@app.command("export")
+def export_cmd(
+    album_id: str = typer.Argument(..., help="本子 ID"),
+    fmt: str = typer.Option("zip", "--format", help="zip|pdf|longimg"),
+    dest: str | None = typer.Option(None, "--dest", help="落点（默认 <library-root>\\00-Incoming\\_raw_jmcomic）"),
+    filename_rule: str = typer.Option("Atitle", "--filename-rule", help="A 前缀=本子字段，P 前缀=章节字段"),
+    login: bool = typer.Option(True, "--login/--no-login"),
+    impl: str | None = typer.Option(None, "--impl"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """把已下载的本子导出为 ZIP / PDF / 长图。
+
+    走 jmcomic 的 Feature 机制（命中缓存即可导出，不必重下图片）。
+    落点同样受红线约束。
+    """
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        target = Path(dest) if dest else p.raw_jmcomic
+        option = _jm_option(p, dest=target)
+        data = jm_adapter.export(
+            option,
+            album_id,
+            fmt=fmt,
+            dest=target,
+            export_dir=p.export,
+            library_dir=p.library,
+            filename_rule=filename_rule,
+            login=login,
+            impl=impl,
+        )
+        return Envelope(ok=True, data=data)
+
+    _run("export", run)
+
+
+@app.command()
+def domains(
+    include_html: bool = typer.Option(True, "--include-html/--no-html", help="是否抓取网页端域名（需联网）"),
+) -> None:
+    """当前域名池（API 静态池 + 网页端域名）。"""
+
+    def run() -> Envelope:
+        data = jm_adapter.domains(include_html=include_html)
+        warnings: list[str] = []
+        if data.get("html_error"):
+            warnings.append(f"网页端域名抓取失败：{data['html_error']}")
+        return Envelope(ok=True, data=data, warnings=warnings)
+
+    _run("domains", run)
+
+
+@app.command("pick-domain")
+def pick_domain(
+    timeout: float = typer.Option(5.0, "--timeout", help="单域名超时秒数"),
+    limit: int = typer.Option(5, "--limit", help="返回几个最快的可用域名"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """探测域名池，挑出最快可用的几个。
+
+    站点域名天天变 —— 下载报「重试耗尽」时先跑这个。
+    """
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        option = None
+        try:
+            option = _jm_option(p)
+        except Exception:  # noqa: BLE001 - option 缺失也不该挡住域名探测
+            pass
+        data = jm_adapter.pick_domain(option, timeout=timeout, limit=limit)
+        warnings: list[str] = []
+        if not data.get("best"):
+            warnings.append("没有探测到可用域名 —— 检查代理是否开启，或站点已换域名")
+        return Envelope(ok=True, data=data, warnings=warnings)
+
+    _run("pick-domain", run)
 
 
 @app.command()
