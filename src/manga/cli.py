@@ -76,6 +76,7 @@ def _run(command: str, fn) -> None:
             env = fn()
     except MangaError as exc:
         env = exc.to_envelope()
+        _finish_plugins()
         _finalize_job(env)
         raise typer.Exit(code=emit(env)) from exc
     except Exception as exc:  # noqa: BLE001 - 兜底：不让异常裸奔到 agent
@@ -84,8 +85,10 @@ def _run(command: str, fn) -> None:
             error={"code": "UNEXPECTED", "message": f"{type(exc).__name__}: {exc}", "hint": None},
             exit=EXIT_ERROR,
         )
+        _finish_plugins()
         _finalize_job(env)
         raise typer.Exit(code=emit(env)) from exc
+    _finish_plugins()
     _finalize_job(env)
     raise typer.Exit(code=emit(env))
 
@@ -653,13 +656,32 @@ def _jm_option(p: Paths, *, dest: Path | None = None):
 
     落点由 CLI 决定（option 文件只提供 client/download 行为），
     红线目录（共享区 / 权威库）在构造阶段就被拒。
+
+    同时把 option 记到 ``_current_options`` —— 命令退出前要调
+    ``wait_all_plugins_finish()`` 等异步插件收工（上游只定义、不自动调）。
     """
-    return jm_adapter.build_option(
+    option = jm_adapter.build_option(
         p.option_file,
         dest=dest,
         export_dir=p.export,
         library_dir=p.library,
     )
+    _current_options.append(option)
+    return option
+
+
+#: 本次命令用到的 JmOption（退出前统一等插件收工）
+_current_options: list[Any] = []
+
+
+def _finish_plugins() -> None:
+    """命令收尾：等异步插件干完活（见 :func:`runtime.finish_plugins`）。"""
+    while _current_options:
+        option = _current_options.pop()
+        try:
+            runtime.finish_plugins(option)
+        except Exception:  # noqa: BLE001 - 停机失败不该盖掉命令结果
+            pass
 
 
 def _run_in_log_dir(p: Paths, fn):

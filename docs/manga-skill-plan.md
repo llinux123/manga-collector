@@ -162,6 +162,7 @@
 
 ### P4 · 加固 · 测试 · 交付
 
+- **状态**：✅ 已完成（2026-11-07）
 - **实施步骤**
   1. 依赖探测：启动时检查 21 个插件的可选依赖，缺失给出安装命令（不自动 pip install）。
   2. 日志治理：CLI 启动即 chdir 到固定工作目录，杜绝 `jmcomic-download.log` 落在仓库根；日志路径集中配置。
@@ -169,11 +170,22 @@
   4. 测试：单测（envelope / 退出码映射 / DirRule 渲染 / 红线断言）+ 离线集成（本地 fixture 库）+ 真实冒烟（`JM_LIVE=1` 门控：1 本 2 话 → CBZ → 入库 → 校验退出码 0）。
   5. 交付：`uv tool install` 打包；README（安装 / 常用流程 / 排错）；可选 `npx skills link` 到 `user-agents` 便于全局使用。
 - **验收标准**
-  - [ ] 单测 + 离线集成全绿
-  - [ ] `JM_LIVE=1` 冒烟通过
-  - [ ] `uv tool install` 后 `manga --help` 可用
-  - [ ] 仓库根不再出现 `jmcomic-download.log`
-  - [ ] 上游 jmcomic 锁版本 + 升级流程写进 README
+  - [x] 单测 + 离线集成全绿（**231 passed, 1 skipped**）
+  - [x] `JM_LIVE=1` 冒烟**用例就绪**（`tests/test_live_smoke.py`：2 章下载 → CBZ → 入库 → `verify --series` 退出码 0 → 共享区零新增；默认跳过，跑它需要联网 + 代理）
+  - [x] `uv tool install` 后 `manga --help` 可用（实测通过）
+  - [x] 仓库根不再出现 `jmcomic-download.log`（测试钉死：日志目录不可写时退到临时目录并给 warning）
+  - [x] 上游 jmcomic 锁版本 + 升级流程写进 README（README「版本锁定与升级流程」）
+
+#### 2026-11-07 实现要点
+
+| 项 | 关键决策 |
+|---|---|
+| 优雅停机 | 上游 `wait_all_plugins_finish()` **只定义、零调用点** → 我们在命令退出前显式调；兜底：老版本没这方法 / 插件收工抛异常，都不影响命令本身的结果 |
+| 日志治理 | 切到 `<书库根>\Manga\Metadata\logs`；目录不可写 → 退系统临时目录 → 再退当前目录，**每一步都给 warning**，不让命令崩 |
+| 依赖探测补强 | 外部命令的探测结果**也带安装命令**（原来只说「缺 gallery-dl」不说怎么装） |
+| 打包 | `uv tool install --from . manga-collector`（注意包名是 `manga-collector`）；受限环境用 `UV_TOOL_DIR` / `UV_TOOL_BIN_DIR` 指到工作区 |
+| Skill 全局安装 | 用**目录联接**（不是拷贝）→ 改仓库即时生效；`Remove-Item` 解链不删源 |
+| 升级流程 | 升 jmcomic 必须走 `jmcomic_facts check` → `doc_claims check` → pytest → JM_LIVE 冒烟 —— 否则 references 会悄悄过期 |
 
 ---
 

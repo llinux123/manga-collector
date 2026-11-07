@@ -11,9 +11,10 @@
 | [docs/workspace-dependency.md](docs/workspace-dependency.md) | 与 manga 工作区的依赖契约（路径、环境变量、脚本约定） |
 | [.agents/skills/manga/SKILL.md](.agents/skills/manga/SKILL.md) | **Skill 主体**：分派表、命令清单、输出契约、错误处置、红线、写操作确认 |
 | [.agents/skills/manga/references/](.agents/skills/manga/references/) | 按需加载的知识：`pipeline` `troubleshooting` `jmcomic` `option-and-plugins` `naming` `sources` `servers` |
-| [src/manga/](src/manga/) | **薄 CLI**：`paths` `doctor` `verify` `ingest` `convert-cbz` `guard` |
+| [src/manga/](src/manga/) | **薄 CLI**（20 个命令）：`paths` `doctor` `verify` `ingest` `convert-cbz` `guard` `search` `album` `comments` `download` `export` `domains` `pick-domain` `job *` `favorites` `checkin` `gallery-dl` `mangadex-dl` `actions-gen` `server *` `version` |
 | [config/jmcomic-option.yml](config/jmcomic-option.yml) | jmcomic 本机配置模板（`dir_rule.rule` 已修正，见下） |
-| [tests/](tests/) | pytest 用例（信封契约、退出码映射、红线守卫、dry-run 不落盘、DirRule 渲染回归） |
+| [tests/](tests/) | pytest 用例（信封契约、退出码映射、红线守卫、dry-run 不落盘、DirRule 渲染回归、作业模型、references 同步性守护） |
+| [tools/](tools/) | 防腐烂工具：`jmcomic_facts.py`（源码事实提取）、`doc_claims.py`（文档声明核对） |
 
 ## 与 manga 工作区的关系
 
@@ -31,6 +32,38 @@ manga-collector（本仓库）                  manga 工作区（另一个仓�
 详见 [docs/workspace-dependency.md](docs/workspace-dependency.md)。
 
 ## 快速开始
+
+### 安装
+
+```powershell
+# A) 开发装（推荐：改代码立刻生效）
+uv venv; uv pip install -e ".[dev]"
+
+# B) 工具装（装成全局命令 `manga`）
+uv tool install --from . manga-collector
+#   受限环境（沙箱 / 无写权限的 APPDATA）用工作区内的目录：
+#   $env:UV_TOOL_DIR = "$PWD\.uv-tools"; $env:UV_TOOL_BIN_DIR = "$PWD\.uv-bin"
+#   uv tool install --from . manga-collector
+```
+
+装完验证：`manga --help` / `manga version` / `manga doctor`。
+
+### 把 Skill 装到用户级（全局可用）
+
+Skill 主体在 `.agents/skills/manga/`。要让它在**所有会话**里可用，做一个**目录联接**
+到用户级 skill 目录（DSH 读 `~/.agents/skills/`，Claude Code 读 `~/.claude/skills/`）：
+
+```powershell
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.agents\skills\manga" `
+         -Target "$PWD\.agents\skills\manga"
+New-Item -ItemType Junction -Path "$env:USERPROFILE\.claude\skills\manga" `
+         -Target "$PWD\.agents\skills\manga"
+```
+
+联接的好处：改仓库里的 SKILL.md / references **立即生效**，不用反复拷贝。
+（`Remove-Item <链接路径>` 即可解链，**不会**删掉目标目录。）
+
+### 常用流程
 
 ```powershell
 # 0) 装环境
@@ -52,6 +85,24 @@ manga verify                 # 校验闸门：退出码 0 才算入库成功
 manga guard --snapshot .export-snapshot.json
 manga guard --compare .export-snapshot.json
 ```
+
+**下载走作业模型**（别用一条同步命令死等）：
+
+```powershell
+manga job start download 404005 390442 --apply   # 立刻返回 job_id
+manga job poll <job_id>                            # 几秒就回（间隔 ≥ 15s，别高频轮询）
+manga job result <job_id>                          # 终态摘要
+manga job cancel <job_id>                          # 真能停（协作式：写取消标记，子进程自己退出）
+```
+
+### 排错
+
+| 症状 | 先看 |
+|---|---|
+| 命令报错 / 结果不对 | `manga doctor` → 再看 [references/troubleshooting.md](.agents/skills/manga/references/troubleshooting.md) |
+| 退出码含义 | [references/pipeline.md](.agents/skills/manga/references/pipeline.md)（PS ↔ CLI 映射） |
+| 校验器报了什么 | `manga verify --report-path 报告.csv`（完整清单；控制台只显示前 N 条） |
+| 存量库全库校验不为 0 | 那是历史问题，不是你刚入库那本的错 → 用 `manga verify --series <名>` 做增量验收 |
 
 ## 输出契约
 
@@ -112,7 +163,7 @@ Copy-Item -Recurse .agents\skills\manga "$env:USERPROFILE\.agents\skills\manga"
 | **P1** | jmcomic 适配层：search / album / comments / download / export / domains / pick-domain | ✅ 已提交（含一轮修复） |
 | **P2** | 参考表补齐与校准（21 个插件 kwargs / DirRule 变量 / 证据等级标注） | ✅ 已完成 |
 | **P3** | gallery-dl / mangadex-downloader 适配器 + 长任务模型 + GitHub Actions 生成器 | ✅ 已完成 |
-| **P4** | 加固（日志治理、依赖探测、优雅停机）、测试、装配与发布 | 🟡 进行中 |
+| **P4** | 加固（日志治理、依赖探测、优雅停机）、测试、装配与发布 | ✅ 已完成 |
 
 ### P2 当前进度
 
@@ -185,9 +236,66 @@ manga actions-gen                                  # 生成 workflow（dry-run�
 | 增量校验 | ✅ | `manga verify --series <名>` 只校验指定系列 —— 存量库有历史问题时，全库闸门永远不是 0。选中的系列会复制进临时影子库根再验（原库零改动，验完即删）；支持嵌套系列（`18comic/繼母與繼姐`）与来源层自动摊平；`verify` 输出带 `series_available` |
 | 入库路径显式化 | ✅ | `ingest` 显式传 `-BackupRoot` / `-LogPath`，不再依赖 CWD（默认 `./backup` 会写进仓库根） |
 | 脚本输出透出 | ✅ | 脚本退出码 1 时把输出尾部放进 `warnings` —— 不再只丢一句「有冲突或告警」 |
-| `option.wait_all_plugins_finish()` | ⏳ | 退出前优雅停机（自定义异步插件用） |
-| `uv tool install` 打包 + 用户级 skill 安装 | ⏳ | `pyproject` 已有 console script，未做安装实测 |
+| `option.wait_all_plugins_finish()` | ✅ | **上游只定义、从不自动调用**（全仓零调用点）→ 我们在命令退出前显式等异步插件收工；`runtime.finish_plugins()` 做了「老版本没这方法 / 插件炸了都不影响命令结果」的兜底 |
+| `uv tool install` 打包 | ✅ | `uv tool install --from . manga-collector` 实测通过，装完 `manga --help` / `version` / `doctor` 都正常；受限环境用 `UV_TOOL_DIR` / `UV_TOOL_BIN_DIR` 指到工作区 |
+| 用户级 Skill 安装 | ✅ | 文档写清**目录联接**做法（`~/.agents/skills/manga` ← 仓库 `.agents/skills/manga`）；改仓库即时生效，解链不删源 |
+| 锁版本 + 升级流程 | ✅ | README 新增「版本锁定与升级流程」：升 jmcomic 必须走 `jmcomic_facts check` → `doc_claims check` → pytest → JM_LIVE 冒烟，否则 references 会悄悄过期 |
+| 真机冒烟（JM_LIVE=1） | ✅ 测试已就绪 | `tests/test_live_smoke.py`：2 章下载 → CBZ → 入库 → `verify --series` 退出码 0 → 共享区零新增。默认跳过，`$env:JM_LIVE="1"` 才跑（需联网 + 代理） |
 
+## 版本锁定与升级流程
+
+### 锁版本
+
+| 依赖 | 锁定方式 | 理由 |
+|---|---|---|
+| `jmcomic` | `jmcomic>=2.7.11`（下限硬校验在 `runtime.MIN_JMCOMIC_VERSION`） | 低于 2.7.11 的 option 新字段会被**静默忽略**（表现为「配了不生效」），`doctor` 会报出来 |
+| `typer` / `rich` / `pyyaml` | `>=` 下限 + `uv.lock` 锁死具体版本 | 复现性；升级走下面的流程 |
+| Python | `>=3.14` | 用了 3.12+ 的语法与 `tempfile` 行为差异 |
+
+`uv.lock` 是**权威版本记录** —— 别人 clone 下来 `uv sync` 得到的版本和你一样。
+
+### 升级 jmcomic 的流程（**别直接改版本号就跑**）
+
+上游一升级，**references 里的事实就会过期**（插件 kwargs、DirRule 变量、默认值都可能变）。
+所以升级必须走这条流水线：
+
+```powershell
+# 1) 改 pyproject 的 jmcomic 版本，重新锁
+#    pyproject.toml: jmcomic>=2.7.12
+uv lock
+
+# 2) 装上新的，看它到底变了什么
+uv sync
+uv run python tools/jmcomic_facts.py plugins    # 21 个插件的真实形参/依赖
+uv run python tools/jmcomic_facts.py dirrule    # DirRule 可用变量 + 与文档的差异
+uv run python tools/jmcomic_facts.py check      # ← references 是否已过期
+
+# 3) 跑声明核对（API / 常量 / 异常 / 脚本 / 正则 / CLI 命令）
+uv run python tools/doc_claims.py check
+
+# 4) 跑测试（221 项，含「references 与源码同步」的守护）
+uv run pytest
+
+# 5) 按 check 的报告更新 references（改完 check 要变绿）
+#    并在 references 里更新「校对日期」
+
+# 6) 真机冒烟（要联网 + 代理）
+$env:JM_LIVE = "1"; uv run pytest tests/test_live_smoke.py -v
+```
+
+**第 2 步的 `check` 变红就说明文档过期了** —— 这两个工具就是为此存在的：
+`jmcomic_facts.py` 管「源码里的事实」，`doc_claims.py` 管「文档里的声明」。
+
+### 真机冒烟
+
+```powershell
+$env:JM_LIVE = "1"                                  # 不设就跳过
+$env:JM_LIVE_PHOTOS = "404005 390442"               # 可选：换章节
+uv run pytest tests/test_live_smoke.py -v
+```
+
+跑的是**全链路**：2 章下载 → CBZ → 入库 → `verify --series` 退出码 0 → 共享区零新增。
+落点全在**工作区内的临时书库**，不碰真实书库。
 提交信息格式：`<类型>(P<阶段号>): <祈使句>`，例如 `feat(P1): jmcomic 适配层 —— 搜索/详情/下载/导出`。
 阶段分支 `p/<阶段号>-<短名>`，squash 合入 `main`，保证 `main` 历史里 **一个阶段 = 一个提交**。
 

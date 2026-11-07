@@ -25,6 +25,30 @@ from typing import Any, Iterator
 #: jmcomic 最低可用版本（option 新字段与 Feature 在 2.7.x 才稳定）
 MIN_JMCOMIC_VERSION = "2.7.11"
 
+
+def finish_plugins(option: Any) -> list[str]:
+    """退出前等异步插件收工。
+
+    ⚠ **jmcomic 2.7.11 只定义、从不自动调用** ``option.wait_all_plugins_finish()``
+    （全仓 grep：只有定义处 `jm_option.py:1050`，零调用点）。
+    自定义异步插件靠 ``enter_wait_list()`` 登记自己，
+    不由调用方显式等 → 它们会一直挂着，进程退出时才被强杀。
+
+    这里补上这一步：遍历 ``option.need_wait_plugins``，逐个 ``wait_until_finish()``。
+    没有异步插件时是 no-op；上游改了方法名也不会炸（ getattr 判空 + 吞异常）。
+    """
+    if option is None:
+        return []
+    waiter = getattr(option, "wait_all_plugins_finish", None)
+    if waiter is None:
+        return []
+    try:
+        waiter()
+    except Exception:  # noqa: BLE001 - 停机失败不该盖掉命令本身的结果
+        return []
+    plugins = getattr(option, "need_wait_plugins", None) or []
+    return [str(getattr(plugin, "plugin_key", type(plugin).__name__)) for plugin in plugins]
+
 #: 可选 Python 依赖：(导入名, pip 名, 什么时候用得上)
 OPTIONAL_DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
     ("img2pdf", "img2pdf", "export --format pdf"),
@@ -34,11 +58,12 @@ OPTIONAL_DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
     ("pikepdf", "pikepdf", "export 加密 pdf"),
 )
 
-#: 可选外部命令：(命令名, 什么时候用得上)
-OPTIONAL_EXECUTABLES: tuple[tuple[str, str], ...] = (
-    ("gallery-dl", "通用站下载（P3 适配器的前置）"),
-    ("mangadex-dl", "MangaDex 下载（P3 适配器的前置）"),
-    ("jmcomic", "jmcomic 原生 CLI（降级路径）"),
+#: 可选外部命令：(命令名, 什么时候用得上, 安装命令)
+#: ⚠ 跟 Python 依赖一样**只给命令、绝不自动装**（红线：不替用户改环境）。
+OPTIONAL_EXECUTABLES: tuple[tuple[str, str, str], ...] = (
+    ("gallery-dl", "通用站下载（P3 适配器的前置）", "uv tool install gallery-dl"),
+    ("mangadex-dl", "MangaDex 下载（P3 适配器的前置）", "uv tool install mangadex-dl"),
+    ("jmcomic", "jmcomic 原生 CLI（降级路径）", "uv pip install 'jmcomic>=2.7.11'"),
 )
 
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
@@ -102,10 +127,10 @@ def dependency_report() -> dict[str, Any]:
             )
 
     missing_executables: list[dict[str, Any]] = []
-    for command, usage in OPTIONAL_EXECUTABLES:
+    for command, usage, install in OPTIONAL_EXECUTABLES:
         path = shutil.which(command)
         if not path:
-            missing_executables.append({"command": command, "usage": usage})
+            missing_executables.append({"command": command, "usage": usage, "install": install})
 
     return {
         "missing_modules": missing_modules_list,
