@@ -101,6 +101,16 @@ class Paths:
         return self.library_root / "Manga" / "Metadata"
 
     @property
+    def logs(self) -> Path:
+        """运行日志目录：jmcomic 的进度日志固定落在这里。
+
+        jmcomic 把进度日志写成**相对路径**（``jmcomic-download.log``），
+        落点就是进程工作目录 → 调 jmcomic 之前先切到本目录，
+        日志就不会掉进仓库根。
+        """
+        return self.metadata / "logs"
+
+    @property
     def export(self) -> Path:
         """干净导出目录 → Syncthing 共享给手机。
 
@@ -160,6 +170,7 @@ class Paths:
             "raw_jmcomic": str(self.raw_jmcomic),
             "library": str(self.library),
             "metadata": str(self.metadata),
+            "logs": str(self.logs),
             "export": str(self.export),
             "scripts_dir": str(self.scripts_dir),
             "profile_dir": str(self.profile_dir),

@@ -88,9 +88,11 @@ class TestRedLine:
         raw = library_root / "00-Incoming" / "_raw_jmcomic"
         assert jm.ensure_safe_dest(raw, export_dir=library_root / "Export" / "Manga") == raw
 
-    def test_is_inside(self, tmp_path: Path) -> None:
-        assert jm.is_inside(tmp_path / "a" / "b", tmp_path)
-        assert not jm.is_inside(tmp_path.parent / "elsewhere", tmp_path)
+    def test_is_inside(self, workdir: Path) -> None:
+        # 用 conftest 的 workdir（普通 mkdir）而不是 tmp_path：
+        # pytest 的 tmp_path 目录带 0o700 权限，沙箱内的受限进程读不了。
+        assert jm.is_inside(workdir / "a" / "b", workdir)
+        assert not jm.is_inside(workdir.parent / "elsewhere", workdir)
 
 
 # ── 异常映射 ──────────────────────────────────────────────────────────────
@@ -122,6 +124,104 @@ class TestErrorMapping:
         err = jm._map_exception(ValueError("炸了"), what="下载")
         assert err.exit_code == EXIT_ERROR
         assert err.code == "VALUEERROR"
+
+
+# ── 导出依赖（P4 加固） ───────────────────────────────────────────────────
+
+
+class TestExportDependencies:
+    def test_missing_dependency_gives_install_command(self, monkeypatch, library_root: Path) -> None:
+        monkeypatch.setattr(jm, "missing_modules", lambda mods: ["img2pdf"])
+        with pytest.raises(MangaError) as excinfo:
+            jm.export(object(), "123456", fmt="pdf", dest=library_root / "00-Incoming" / "_raw_jmcomic")
+        assert excinfo.value.code == "DEP_MISSING"
+        assert excinfo.value.exit_code == EXIT_ERROR
+        assert "img2pdf" in (excinfo.value.hint or "")
+        assert "uv pip install" in (excinfo.value.hint or "")
+
+    def test_zip_export_needs_no_extra_dependency(self) -> None:
+        """未加密 zip 走标准库 zipfile → 不该被依赖检查拦下。"""
+        assert jm.EXPORT_DEPENDENCIES["zip"] == ()
+        assert jm.EXPORT_DEPENDENCIES["pdf"] == ("img2pdf",)
+
+    def test_import_error_maps_to_dep_missing_with_hint(self) -> None:
+        err = jm._map_exception(ImportError("No module named 'img2pdf'", name="img2pdf"), what="导出")
+        assert err.code == "DEP_MISSING"
+        assert err.exit_code == EXIT_ERROR
+        assert "uv pip install img2pdf" in (err.hint or "")
+
+
+# ── 干跑降级 ──────────────────────────────────────────────────────────────
+
+
+class TestDryRunDegrade:
+    def test_metadata_failure_degrades_to_minimal_plan(self, monkeypatch, library_root: Path) -> None:
+        class FakeClient:
+            def get_album_detail(self, album_id: str):
+                raise RuntimeError("站点抽风")
+
+        monkeypatch.setattr(jm, "make_client", lambda *a, **k: FakeClient())
+        result = jm.download(
+            object(),
+            ["123456"],
+            dest=library_root / "00-Incoming" / "_raw_jmcomic",
+            dry_run=True,
+        )
+        assert result["dry_run"] is True
+        assert result["degraded"] == 1
+        plan = result["plan"][0]
+        assert plan["degraded"] is True
+        assert plan["id"] == "123456"
+        assert plan["episodes"] is None
+        assert "站点抽风" in plan["error"]
+
+
+# ── 上游形态陷阱（P1 回归） ───────────────────────────────────────────────
+
+
+class TestUpstreamShape:
+    def test_episode_list_is_a_tuple_not_an_object(self) -> None:
+        """jmcomic 的 episode_list 是元组 —— 按对象取会静默拿到 None。"""
+        entry = jm._episode_entry(("404005", "1", "幸福督市", "2024-01-01"))
+        assert entry["id"] == "404005"
+        assert entry["index"] == "1"
+        assert entry["name"] == "幸福督市"
+
+    def test_episode_entry_accepts_objects_too(self) -> None:
+        class FakePhoto:
+            photo_id = "390442"
+            album_index = 2
+            name = "幸福督市_2"
+            page_arr = ["a", "b", "c"]
+
+        entry = jm._episode_entry(FakePhoto())
+        assert entry["id"] == "390442"
+        assert entry["index"] == 2
+        assert entry["images"] == 3
+
+    def test_manifest_lives_in_manifest_dict(self) -> None:
+        """清单在 manifest_dict 里，没有 .manifest 属性 —— 取错就是「成功但 0 张图」。"""
+
+        class FakeManifest:
+            def __init__(self, files):
+                self.image_filepath_list = list(files)
+
+        class FakeDownloader:
+            def __init__(self):
+                self.manifest_dict = {"a": FakeManifest(["1.jpg", "2.jpg"]), "b": FakeManifest(["3.jpg"])}
+
+        dler = FakeDownloader()
+        assert jm._manifest_images(dler) == ["1.jpg", "2.jpg", "3.jpg"]
+        assert len(jm._manifest_objects(dler)) == 2
+
+    def test_manifest_falls_back_to_legacy_attribute(self) -> None:
+        class LegacyManifest:
+            image_filepath_list = ["x.jpg"]
+
+        class LegacyDownloader:
+            manifest = LegacyManifest()
+
+        assert jm._manifest_images(LegacyDownloader()) == ["x.jpg"]
 
 
 # ── CLI 契约（离线） ───────────────────────────────────────────────────────

@@ -62,6 +62,44 @@ manga doctor      # PowerShell？脚本在不在？jmcomic 装没装？代理端
 | `uv` 报缓存权限错 | 设 `UV_CACHE_DIR=<仓库>\.uv-cache` |
 | Python 建的临时目录里不能再建子目录 | Windows 下 `tempfile.mkdtemp` 会套受限权限；用普通 `mkdir` |
 
+## 5b. 依赖与登录态（P4 加固后新增）
+
+`manga doctor` 现在会多报三块：`jmcomic_version`（含版本下限 `2.7.11`）、`auth`（登录态）、`dependencies`（缺哪些可选依赖）。
+
+| 现象 | 处理 |
+|---|---|
+| `DEP_MISSING`：导出缺少 `img2pdf` | `uv pip install img2pdf`（`--format longimg` 缺的是 `pillow`；加密 zip 缺 `pyzipper`/`py7zr`；加密 pdf 缺 `pikepdf`）。**CLI 不会自动装**，它只给命令 |
+| `auth.logged_in = false` 但有 `has_username`/`has_password` | 那只是**凭据**不是登录态 —— 下载时 jmcomic 才会去登录。失败点会出现在下载阶段（退出码 3），不在配置阶段 |
+| `auth.logged_in = false` 且有 cookies | cookies 在，但缺**用户标识**：`api` 客户端要 `auth.user_id`，`html` 客户端要 `auth.username` |
+| `doctor` 报 `jmcomic` 版本低于下限 | option 新字段会被**静默忽略**（表现为「配了不生效」）→ 升级 jmcomic |
+| 干跑里 `plan[].degraded = true` | 取不到元数据（站点抽风 / 代理不通 / 本子被删）。干跑**不会**因此失败，已降级为最小计划；但 `warnings` 里会提示，`--apply` 前先确认 |
+
+## 5b-2. 校验闸门是**整库**的
+
+`manga verify` 扫的是**整个权威库**：库里只要有一条 error，退出码就是 2。
+存量库（上千个 CBZ、几千条历史问题）永远拿不到 0 —— **这不是你刚入库那本的错**。
+
+**增量验收**用 `--series`：
+
+```powershell
+manga verify --series 幸福督市            # 只验这一个系列
+manga verify --series "18comic/繼母與繼姐"  # 嵌套系列用相对路径
+manga verify --series 18comic              # 来源层会自动摊平成叶子系列
+```
+
+- `--series` 会把选中的系列**复制**到临时影子库根再验，**原库一个字节都不动**，验完即删；
+- 之所以要复制：校验脚本只认「库根/系列/文件.cbz」，把库根指向系列目录会让文件落在
+  库根下 → 被判成「文件直接位于库根目录」→ 退出码 2；
+- `manga verify` 的输出里有 `series_available`：库里所有直接装着 CBZ 的目录（相对路径），
+  agent 据此选，不用猜；
+- 退出码 2 且问题都在**别的**系列里 → 说明那是你要单独处理的历史问题，不是这次的锅。
+
+## 5c. 日志落在哪
+
+`manga download` / `manga export` 在调用 jmcomic **之前**会把工作目录切到
+`<书库根>\Manga\Metadata\logs` → jmcomic 的进度日志（`jmcomic-download.log`，相对路径）
+跟着落在这里，**不会**掉进仓库根。
+
 ## 6. jmcomic 的硬性陷阱（会静默出错，最值得记）
 
 1. **`all_success` 在用了 filter 后恒为 `False`** —— 别拿它当成功判据，用 `manifest` 自己统计。
@@ -76,3 +114,16 @@ manga doctor      # PowerShell？脚本在不在？jmcomic 装没装？代理端
 10. **★ `dir_rule.rule` 的分隔符与写法不能混用**：`Bd_Atitle/Pname` 会渲染成 `<base>/Bd_Atitle/<章节名>/`
     （字面量目录 `Bd_Atitle`）→ 转换脚本会把所有章节归到名为 `Bd_Atitle` 的系列下。
     正确写法：`Bd/Atitle/Pname`、`Bd_Atitle_Pname`、`Bd / {Atitle} / {Pname}`。详见 [naming.md](naming.md)。
+11. **★ jmcomic 的日志默认打在 `stdout`**（`jm_config.setup_default_jm_logger`）——
+    一条 `[2026-11-07 10:24:52] ...` 就能让 JSON 解析失败。
+    本项目的 CLI 已把 jmcomic 日志改道到 stderr（`runtime.route_jm_logs_to_stderr`）；
+    自己写脚本调用 jmcomic 时必须自己做这层隔离。
+12. **★ `album.episode_list` 是元组不是对象**：`(photo_id, photo_index, photo_title, photo_pub_date)`。
+    按 `item.photo_id` 取会抛 `AttributeError` → 被 `_safe` 吞成 `None` →
+    「话数对得上、每话字段全空」的假成功。
+13. **★ 下载清单在 `downloader.manifest_dict`（按实体索引的 dict）**，**没有** `downloader.manifest` 属性。
+    取错属性 → 「下载成功但 0 张图」的假成功（图片其实已在磁盘上）。
+    统计下载结果一律自己数 `manifest.image_filepath_list`。
+14. **入库脚本的 `-BackupRoot` 默认是 `./backup`（CWD 相对）、`-LogPath` 默认是「脚本目录\logs」**：
+    前者会把备份写进你当时所在的目录（仓库根！），后者在工作区外可能写不动 →
+    脚本退出码 1、文件没动。本项目的 CLI 已显式传这两个参数。

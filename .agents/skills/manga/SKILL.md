@@ -7,7 +7,7 @@ description: >
   或要把下载件变成一话一包 + ComicInfo.xml 的收藏库；或要检查漫画库质量。
   不做：不装第三方扩展；不替用户索要密码或 Cookie；不把灰色来源导出到手机同步区；
   不做 OCR/翻译/超分（另有独立 skill）。
-version: 0.2.0
+version: 0.3.0
 metadata:
   project: manga
   repo: https://github.com/hect0x7/JMComic-Crawler-Python
@@ -34,7 +34,7 @@ CLI 把所有确定性动作（跑脚本、解析退出码、守红线）做掉�
 | 「看看评论区」 | `manga comments 404005` |
 | 「导出成 zip / pdf / 长图」 | `manga export 404005 --format zip\|pdf\|longimg`（落点受红线约束） |
 | 「把这个本子入库」 | `manga convert-cbz --apply` → `manga ingest --apply` → `manga verify` |
-| 「检查一下库」 | `manga verify` |
+| 「检查一下库」 | `manga verify`（**整库闸门**：存量库有历史问题时退出码就是 2；要验收刚入库的那本 → `manga verify --series <系列名>`，系列名见 `verify` 输出里的 `series_available`） |
 | 「看看下载到哪了 / 收件箱里有什么」 | `manga paths` 看落点，再列目录 |
 | 「导出到手机」 | **先问来源等级**：白/绿来源才导出到共享区；灰色来源**直接拒绝**（§5） |
 | 「哪些域名能访问 / 下载报重试耗尽」 | `manga pick-domain`（挑最快的）→ `manga domains`（看池子） |
@@ -50,7 +50,7 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 | 命令 | 作用 | 写操作 |
 |---|---|---|
 | `manga paths` | 打印所有解析后的路径（收件箱/权威库/共享区/脚本目录） | 否 |
-| `manga doctor` | 环境体检：PowerShell、脚本、jmcomic、**代理端口**、目录、工作区 | 否 |
+| `manga doctor` | 环境体检：PowerShell、脚本、jmcomic（**导入 + 版本下限**）、**登录态**、**可选依赖**、代理端口、目录、工作区 | 否 |
 | `manga search` | 禁漫搜索（site/tag/author/work/actor 五维） | 否 |
 | `manga album` | 本子详情（含章节列表） | 否 |
 | `manga comments` | 本子评论（含回评树） | 否 |
@@ -58,7 +58,7 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 | `manga pick-domain` | 并发探测域名池，列出最快的可用域名 | 否 |
 | `manga download` | 下载本子/章节到暂存区 | **默认 dry-run**，要 `--apply` |
 | `manga export` | 导出 ZIP / PDF / 长图（走 jmcomic Feature） | 是 |
-| `manga verify` | 只读校验权威库（命名/元数据/可读率/编号一致性/重复） | 否 |
+| `manga verify` | 只读校验权威库（命名/元数据/可读率/编号一致性/重复）；`--series <名>` 可只校验单个系列（增量验收） | 否 |
 | `manga ingest` | 入库整理：重命名 + 写 ComicInfo.xml + 移入权威库 | **默认 dry-run**，要 `--apply` |
 | `manga convert-cbz` | jmcomic 散图 → `<编号> - <标题>.cbz`（图片平铺包根） | **默认 dry-run**，要 `--apply` |
 | `manga guard` | 红线守卫：查看/快照/比对共享区 `Export\Manga` | 只读（写快照文件除外） |
@@ -141,8 +141,12 @@ mangadex-dl --save-as cbz --path "$env:USERPROFILE\Documents\Library\00-Incoming
 ## 8. 进度与长任务
 
 - 下载大本子可能上百话：**不要一章一话地问用户**，一次确认整本，然后等结果。
-- jmcomic 的进度日志固定写在**当前工作目录**（`jmcomic-download.log`）→ 在固定目录跑命令，别在仓库根跑。
+- jmcomic 的进度日志（`jmcomic-download.log`）是**相对路径**，落点=当前工作目录 →
+  CLI 调 jmcomic 前会先切到 `<书库根>\Manga\Metadata\logs`，日志跟着走，**不会掉进仓库根**。
+  自己直接跑 `jmcomic` 命令时同理：别在仓库根跑。
 - 断点续传：`download.cache: true`，中断后**重跑同一条命令**即可，已下的不会重来。
+- 干跑（`download` 不加 `--apply`）取不到元数据时**不会失败**，会降级成最小计划并在
+  `warnings` 里提示 → `--apply` 之前先看警告。
 
 ## 9. 参考资料（按需读，别一次全读）
 

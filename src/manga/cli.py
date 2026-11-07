@@ -11,10 +11,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import socket
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +36,7 @@ from .envelope import (
     RedLineViolation,
     emit,
 )
+from . import runtime
 
 app = typer.Typer(
     name="manga",
@@ -49,10 +52,19 @@ def _paths(library_root: str | None, scripts_dir: str | None) -> Paths:
     return resolve_paths(library_root=library_root, scripts_dir=scripts_dir)
 
 
+def _timestamp() -> str:
+    """文件名用的时间戳：``20261107-160653``。"""
+    from datetime import datetime
+
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
 def _run(command: str, fn) -> None:
     """执行命令并统一处理异常 → 信封。"""
     try:
-        env = fn()
+        # stdout 只允许出现信封：命令体里任何意外的 print 都改道 stderr
+        with contextlib.redirect_stdout(sys.stderr):
+            env = fn()
     except MangaError as exc:
         raise typer.Exit(code=emit(exc.to_envelope())) from exc
     except Exception as exc:  # noqa: BLE001 - 兜底：不让异常裸奔到 agent
@@ -65,6 +77,91 @@ def _run(command: str, fn) -> None:
     raise typer.Exit(code=emit(env))
 
 
+def _stage_series_for_verify(p: Paths, series: list[str]) -> Path:
+    """把选中的系列**复制**进一个临时「影子库根」，还原成校验脚本认的两层结构。
+
+    校验脚本只认「库根/系列/文件.cbz」：把库根直接指向系列目录，文件就落在
+    库根下（深度 0）→ 被判成「文件直接位于库根目录」→ 退出码 2。
+    复制一份再验，原库一个字节都不动；验完由调用方删掉。
+
+    ``series`` 可以是顶层目录名（``18comic``），也可以是相对子路径
+    （``18comic/繼母與繼姐``）—— 后者会被摆到影子库根的**第一层**，
+    深度回到 1，不会触发「目录层级过深」告警。
+
+    影子库根优先放 ``Manga\\Metadata`` 下（与权威库同一卷，复制最快），
+    建不出来就退到系统临时目录 —— 用**普通 mkdir** 而不是 ``mkdtemp``：
+    后者在 Windows 上会套 0o700 权限，受限进程随后读不了。
+    """
+    stamp = _timestamp()
+    candidates = [p.metadata / f".verify-scope-{stamp}", Path(tempfile.gettempdir()) / f"manga-verify-scope-{stamp}"]
+
+    stage: Path | None = None
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".writable"
+            probe.write_text("x", encoding="utf-8")
+            probe.unlink()
+            stage = candidate
+            break
+        except OSError:
+            continue
+
+    if stage is None:
+        raise MangaError(
+            "无法创建临时影子库根（增量校验需要一个可写目录）",
+            code="STAGE_FAILED",
+            exit_code=EXIT_ERROR,
+            hint="检查书库目录权限，或设 TEMP 到一个可写目录后重试",
+        )
+
+    shutil.rmtree(stage, ignore_errors=True)
+    stage.mkdir(parents=True, exist_ok=True)
+    for name in series:
+        src = p.library / name
+        # 该目录自己就装着 CBZ → 整个搬过去；
+        # 否则它是「来源层」（如 18comic），里面还套着系列 → 只搬叶子系列，
+        # 让每个叶子系列在影子库根里都是第一层，深度恒为 1。
+        leaves = _leaf_series_dirs(src)
+        if leaves:
+            for leaf in leaves:
+                shutil.copytree(leaf, stage / leaf.name)
+        else:
+            shutil.copytree(src, stage / Path(name).name)
+    return stage
+
+
+def _leaf_series_dirs(root: Path) -> list[Path]:
+    """``root`` 下**直接装着 CBZ** 的子目录（没有则空列表）。"""
+    if not root.is_dir():
+        return []
+    leaves = [child for child in sorted(root.iterdir()) if child.is_dir() and any(child.glob("*.cbz"))]
+    return leaves
+
+
+def _series_with_files(library: Path) -> list[str]:
+    """库里所有**直接装着 CBZ** 的目录（相对路径），供 agent 选。"""
+    if not library.is_dir():
+        return []
+    found: set[str] = set()
+    for cbz in library.rglob("*.cbz"):
+        parent = cbz.parent
+        try:
+            rel = parent.relative_to(library)
+        except ValueError:  # pragma: no cover - 不该发生
+            continue
+        found.add(str(rel) if str(rel) != "." else parent.name)
+    return sorted(found)
+
+
+def _script_output_tail(result: pipeline.ScriptResult, limit: int = 1200) -> str:
+    """脚本输出的尾部（给 agent 看真实原因，别只丢一句「有告警」）。"""
+    text = (result.stdout or "").strip() or (result.stderr or "").strip()
+    if not text:
+        return ""
+    return text[-limit:]
+
+
 def _script_result_to_envelope(
     result: pipeline.ScriptResult,
     *,
@@ -75,6 +172,10 @@ def _script_result_to_envelope(
     warnings = list(extra_warnings or [])
     if result.warned:
         warnings.append(f"{result.script} 退出码 1：有冲突或告警（不是错误）")
+        tail = _script_output_tail(result)
+        if tail:
+            # 退出码 1 常常是「真的没干成活」（权限/路径），把原文给 agent 看
+            warnings.append(f"{result.script} 输出尾部：{tail}")
     payload: dict[str, Any] = {"script": result.script, "exit_code": result.exit_code}
     payload.update(data or {})
     if result.failed:
@@ -114,7 +215,10 @@ def doctor(
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
-    """环境体检：PowerShell、脚本、jmcomic、代理端口、目录状态。"""
+    """环境体检：PowerShell、脚本、jmcomic（导入 + 版本下限）、登录态、可选依赖、代理端口、目录状态。
+
+    只读体检：不联网、不安装任何东西、不索要凭据。
+    """
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
@@ -136,14 +240,64 @@ def doctor(
                 }
             )
 
-        # 3) jmcomic
+        # 3) jmcomic（导入 + 版本下限）
+        jmcomic_version: str | None = None
         try:
             import jmcomic  # noqa: PLC0415
 
-            ver = getattr(jmcomic, "__version__", None)
-            checks.append({"check": "jmcomic", "ok": True, "detail": ver or "已安装（无 __version__）"})
+            jmcomic_version = getattr(jmcomic, "__version__", None)
+            enough = runtime.version_at_least(jmcomic_version, runtime.MIN_JMCOMIC_VERSION)
+            if enough is False:
+                checks.append(
+                    {
+                        "check": "jmcomic",
+                        "ok": False,
+                        "detail": f"{jmcomic_version or '未知版本'} 低于下限 {runtime.MIN_JMCOMIC_VERSION}（option 新字段会被静默忽略）",
+                    }
+                )
+            else:
+                detail = jmcomic_version or "已安装（无 __version__）"
+                if enough is None:
+                    detail += f"（版本号无法与下限 {runtime.MIN_JMCOMIC_VERSION} 比对）"
+                checks.append({"check": "jmcomic", "ok": True, "detail": detail})
         except Exception as exc:  # noqa: BLE001
             checks.append({"check": "jmcomic", "ok": False, "detail": f"导入失败：{exc}"})
+
+        # 3b) 登录态（只读 option，不联网、不触发登录）
+        auth = runtime.auth_state(p.option_file)
+        checks.append(
+            {
+                "check": "auth",
+                "ok": True,  # 未登录不是环境故障：多数本子无需登录
+                "detail": auth["detail"],
+            }
+        )
+        if not auth["logged_in"] and not (auth["has_username"] and auth["has_password"]):
+            warnings.append(
+                "未登录：收藏夹 / 签到 / 敏感题材需要登录；"
+                "用 setx JM_USERNAME / JM_PASSWORD 配置（CLI 不索要凭据）"
+            )
+
+        # 3c) 可选依赖（只报告，不安装）
+        deps = runtime.dependency_report()
+        for item in deps["missing_modules"]:
+            checks.append(
+                {
+                    "check": f"dep:module:{item['module']}",
+                    "ok": True,  # 可选依赖缺失不影响主链路
+                    "detail": f"未安装（{item['usage']}）→ {item['install']}",
+                }
+            )
+        for item in deps["missing_executables"]:
+            checks.append(
+                {
+                    "check": f"dep:cmd:{item['command']}",
+                    "ok": True,
+                    "detail": f"未找到（{item['usage']}）",
+                }
+            )
+        if deps["missing_modules"] or deps["missing_executables"]:
+            warnings.append(deps["install_hint"])
 
         # 4) option 文件与代理端口
         option_file = p.option_file
@@ -181,7 +335,18 @@ def doctor(
                 warnings.append(f"目录不存在：{path}")
 
         ok = all(c["ok"] for c in checks if c["check"] != "proxy")
-        return Envelope(ok=ok, data={"checks": checks}, warnings=warnings, exit=EXIT_OK)
+        return Envelope(
+            ok=ok,
+            data={
+                "checks": checks,
+                "jmcomic_version": jmcomic_version,
+                "min_jmcomic_version": runtime.MIN_JMCOMIC_VERSION,
+                "auth": auth,
+                "dependencies": deps,
+            },
+            warnings=warnings,
+            exit=EXIT_OK,
+        )
 
     _run("doctor", run)
 
@@ -194,22 +359,105 @@ def verify(
     report_path: str | None = typer.Option(None, "--report-path", help="把问题清单写成 CSV"),
     top_n: int = typer.Option(20, "--top-n", help="控制台显示的问题条数（完整清单用 --report-path 的 CSV）"),
     quiet: bool = typer.Option(False, "--quiet", help="只输出汇总"),
+    series: list[str] = typer.Option([], "--series", help="只校验指定系列（可重复），用于增量验收"),
 ) -> None:
-    """只读校验权威库（对应 Test-MangaLibrary.ps1）。"""
+    """只读校验权威库（对应 Test-MangaLibrary.ps1）。
+
+    **这是整库闸门**：库里只要有一条 error，退出码就是 2。
+    新入库的内容要单独验收时，用 ``--series <系列名>`` —— 校验脚本只认
+    「库根/系列/文件.cbz」的两层结构，直接把库根指向系列目录会被判成
+    「文件直接位于库根目录」，所以这里把选中的系列**复制**进一个临时影子库根
+    再跑，验完即删（只读原库，不改一个字节）。
+    """
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
         script = p.script(pipeline.SCRIPT_VERIFY)
-        args: list[str] = ["-LibraryRoot", str(p.library), "-MinPages", str(min_pages), "-TopN", str(top_n)]
-        if report_path:
-            args += ["-ReportPath", str(report_path)]
-        if quiet:
-            args.append("-Quiet")
-        result = pipeline.run_script(script, args)
-        report = pipeline.parse_verify_report(result.stdout)
-        report["issues_listed"] = len(report.get("issues", []))
-        report["issues_note"] = f"问题清单最多列出 {top_n} 条；完整清单用 --report-path 导出 CSV"
-        return _script_result_to_envelope(result, data={"report": report})
+
+        series_available = _series_with_files(p.library)
+
+        stage_root: Path | None = None
+        if series:
+            missing = [name for name in series if not (p.library / name).is_dir()]
+            if missing:
+                raise MangaError(
+                    "找不到系列目录：" + "、".join(missing),
+                    code="SERIES_MISSING",
+                    exit_code=EXIT_NOTFOUND,
+                    hint=(
+                        "系列名 = 权威库下的目录名。"
+                        + (f"当前库里有：{'、'.join(series_available)}" if series_available else "")
+                    ),
+                )
+            stage_root = _stage_series_for_verify(p, series)
+
+        try:
+            roots = [stage_root] if stage_root is not None else [p.library]
+            reports: list[dict[str, Any]] = []
+            warnings: list[str] = []
+            failure: pipeline.ScriptResult | None = None
+
+            for root in roots:
+                args: list[str] = [
+                    "-LibraryRoot",
+                    str(root),
+                    "-MinPages",
+                    str(min_pages),
+                    "-TopN",
+                    str(top_n),
+                ]
+                if report_path:
+                    target = Path(report_path)
+                    if len(roots) > 1:
+                        target = target.with_name(f"{target.stem}-{root.name}{target.suffix}")
+                    args += ["-ReportPath", str(target)]
+                if quiet:
+                    args.append("-Quiet")
+                result = pipeline.run_script(script, args)
+                report = pipeline.parse_verify_report(result.stdout)
+                report["issues_listed"] = len(report.get("issues", []))
+                report["issues_note"] = f"问题清单最多列出 {top_n} 条；完整清单用 --report-path 导出 CSV"
+                report["root"] = str(root)
+                reports.append(report)
+                if result.warned:
+                    warnings.append(f"{result.script} 退出码 1：{root.name} 有告警（不是错误）")
+                    tail = _script_output_tail(result)
+                    if tail:
+                        warnings.append(f"{result.script} 输出尾部：{tail}")
+                if result.failed and failure is None:
+                    failure = result
+
+            data: dict[str, Any] = {"reports": reports, "series_available": series_available}
+            if len(reports) == 1:
+                data["report"] = reports[0]
+            else:
+                data["report"] = {
+                    "roots": [r["root"] for r in reports],
+                    "series_count": sum(int(r.get("series_count") or 0) for r in reports),
+                    "issues_listed": sum(int(r.get("issues_listed") or 0) for r in reports),
+                }
+            if stage_root is not None:
+                data["scoped_series"] = list(series)
+                data["scope_note"] = (
+                    f"增量校验：{'、'.join(series)} 被复制到临时影子库根后校验，原库未改动"
+                )
+
+            if failure is not None:
+                return Envelope(
+                    ok=False,
+                    data=data,
+                    error={
+                        "code": "SCRIPT_ERROR",
+                        "message": f"{failure.script} 退出码 {failure.exit_code}",
+                        "hint": (failure.stdout or failure.stderr).strip()[-2000:] or None,
+                    },
+                    warnings=warnings,
+                    exit=EXIT_ERROR,
+                )
+            return Envelope(ok=True, data=data, warnings=warnings, exit=EXIT_OK)
+        finally:
+            if stage_root is not None:
+                shutil.rmtree(stage_root, ignore_errors=True)
 
     _run("verify", run)
 
@@ -237,8 +485,11 @@ def ingest(
             "-InboxRoot", str(inbox_root or p.inbox),
             "-LibraryRoot", str(p.library),
         ]
-        if backup_root:
-            args += ["-BackupRoot", str(backup_root)]
+        # 备份与日志都显式指定：脚本的默认值是 CWD 相对（'./backup'）和
+        # 「脚本目录\logs」—— 前者会写进仓库根，后者在工作区外写不动，
+        # 结果就是退出码 1、文件没动、agent 只能猜「有冲突」。
+        args += ["-BackupRoot", str(backup_root or p.backups)]
+        args += ["-LogPath", str(p.logs / f"ingest-{_timestamp()}.log")]
         if generate_comicinfo:
             args.append("-GenerateComicInfo")
         if zero_pad:
@@ -365,6 +616,25 @@ def _jm_option(p: Paths, *, dest: Path | None = None):
     )
 
 
+def _run_in_log_dir(p: Paths, fn):
+    """在固定日志目录下执行 ``fn``，返回 ``(结果, warnings)``。
+
+    日志目录（``<书库根>\\Manga\\Metadata\\logs``）建不出来时**不失败**：
+    退到系统临时目录，再不行就用当前目录 —— 并把这件事告诉用户。
+    """
+    with runtime.working_directory(p.logs) as used:
+        if used is not None:
+            return fn(), []
+
+    fallback = runtime.fallback_log_dir()
+    if fallback is not None:
+        with runtime.working_directory(fallback) as used:
+            if used is not None:
+                return fn(), [f"日志目录不可写（{p.logs}）→ 改用 {used}"]
+
+    return fn(), [f"日志目录不可写（{p.logs}）→ 日志会落在当前工作目录"]
+
+
 @app.command()
 def search(
     query: str = typer.Argument(..., help="关键词（+包含 -排除，空格=AND）"),
@@ -443,20 +713,32 @@ def download(
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
-        target = Path(dest) if dest else p.raw_jmcomic
+        # 落点先解析成绝对路径：切工作目录后相对路径会跟着跑偏
+        target = Path(dest).expanduser().resolve() if dest else p.raw_jmcomic
         option = _jm_option(p, dest=target)
-        data = jm_adapter.download(
-            option,
-            ids,
-            dest=target,
-            export_dir=p.export,
-            library_dir=p.library,
-            photo=photo,
-            dry_run=not apply,
-            login=login,
-            impl=impl,
-        )
-        warnings = [] if apply else ["dry-run：未加 --apply，未下载任何图片"]
+
+        def _do():
+            return jm_adapter.download(
+                option,
+                ids,
+                dest=target,
+                export_dir=p.export,
+                library_dir=p.library,
+                photo=photo,
+                dry_run=not apply,
+                login=login,
+                impl=impl,
+            )
+
+        # 日志治理：jmcomic 的进度日志是相对路径 → 先切到固定日志目录
+        data, warnings = _run_in_log_dir(p, _do)
+        if not apply:
+            warnings.append("dry-run：未加 --apply，未下载任何图片")
+        if data.get("degraded"):
+            warnings.append(
+                f"{data['degraded']} 个 ID 取不到元数据（站点抽风 / 代理不通 / 本子不存在）——"
+                "干跑已降级为最小计划，加 --apply 前先确认"
+            )
         return Envelope(ok=True, data=data, warnings=warnings)
 
     _run("download", run)
@@ -481,20 +763,24 @@ def export_cmd(
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
-        target = Path(dest) if dest else p.raw_jmcomic
+        target = Path(dest).expanduser().resolve() if dest else p.raw_jmcomic
         option = _jm_option(p, dest=target)
-        data = jm_adapter.export(
-            option,
-            album_id,
-            fmt=fmt,
-            dest=target,
-            export_dir=p.export,
-            library_dir=p.library,
-            filename_rule=filename_rule,
-            login=login,
-            impl=impl,
-        )
-        return Envelope(ok=True, data=data)
+
+        def _do():
+            return jm_adapter.export(
+                option,
+                album_id,
+                fmt=fmt,
+                dest=target,
+                export_dir=p.export,
+                library_dir=p.library,
+                filename_rule=filename_rule,
+                login=login,
+                impl=impl,
+            )
+
+        data, warnings = _run_in_log_dir(p, _do)
+        return Envelope(ok=True, data=data, warnings=warnings)
 
     _run("export", run)
 

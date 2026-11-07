@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from ..envelope import EXIT_AUTH, EXIT_ERROR, EXIT_NOTFOUND, MangaError, RedLineViolation
+from ..runtime import missing_modules, route_jm_logs_to_stderr
 
 # ── 常量 ──────────────────────────────────────────────────────────────────
 
@@ -51,6 +52,25 @@ EXPORT_DIR_KWARGS: dict[str, str] = {
     "longimg": "",
 }
 
+#: 导出格式 → 必需的第三方模块（缺失时给出安装命令，不自动装）
+#:
+#: 未加密的 zip 走标准库 ``zipfile`` → 无额外依赖；加密 zip 才要 pyzipper，
+#: 7z 要 py7zr（见 jmcomic 的 ``ZipPlugin.required_dependencies_for``）。
+EXPORT_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "zip": (),
+    "pdf": ("img2pdf",),
+    "longimg": ("PIL",),
+}
+
+#: 导入名 → pip 包名（提示用）
+_PIP_NAMES: dict[str, str] = {
+    "img2pdf": "img2pdf",
+    "PIL": "pillow",
+    "pyzipper": "pyzipper",
+    "py7zr": "py7zr",
+    "pikepdf": "pikepdf",
+}
+
 
 # ── 工具 ──────────────────────────────────────────────────────────────────
 
@@ -65,6 +85,8 @@ def _jmcomic():
             exit_code=EXIT_ERROR,
             hint="uv pip install 'jmcomic>=2.7.11'",
         ) from exc
+    # jmcomic 默认把日志打在 stdout → 会污染 JSON 信封，先改道到 stderr
+    route_jm_logs_to_stderr()
     return jmcomic
 
 
@@ -271,6 +293,34 @@ def search(
 
 # ── 详情 / 评论 ───────────────────────────────────────────────────────────
 
+def _episode_entry(item: Any) -> dict[str, Any]:
+    """把 ``episode_list`` 的一项整理成稳定字段。
+
+    ⚠ jmcomic 2.7.11 的 ``episode_list`` 是**元组**
+    ``(photo_id, photo_index, photo_title, photo_pub_date)``，不是带属性的对象 ——
+    按 ``item.photo_id`` 取会抛 ``AttributeError``，被 ``_safe`` 吞成 ``None``，
+    结果是「话数对得上、每话字段全空」这种最难查的假成功。
+    """
+    if isinstance(item, (tuple, list)):
+        values = list(item)[:4] + [None] * max(0, 4 - len(item))
+        photo_id, index, name, pub_date = values[:4]
+        return {
+            "id": str(photo_id) if photo_id is not None else None,
+            "index": index,
+            "name": name,
+            "pub_date": pub_date,
+            "images": None,  # 元组里没有每话页数
+        }
+
+    return {
+        "id": str(getattr(item, "photo_id", "") or "") or None,
+        "index": getattr(item, "album_index", None),
+        "name": getattr(item, "name", None),
+        "pub_date": None,
+        "images": len(getattr(item, "page_arr", []) or []),
+    }
+
+
 def album_detail(
     option,
     album_id: str,
@@ -282,16 +332,7 @@ def album_detail(
     client = make_client(option, impl=impl, domain_list=domain_list)
     album = client.get_album_detail(str(album_id))
 
-    episodes = []
-    for photo in _safe(lambda: album.episode_list, []) or []:
-        episodes.append(
-            {
-                "id": str(_safe(lambda: photo.photo_id)),
-                "index": _safe(lambda: photo.album_index),
-                "name": _safe(lambda: photo.name),
-                "images": len(_safe(lambda: photo.page_arr, []) or []),
-            }
-        )
+    episodes = [_episode_entry(item) for item in (_safe(lambda: album.episode_list, []) or [])]
 
     return {
         "id": str(_safe(lambda: album.album_id)),
@@ -378,18 +419,55 @@ def download(
     if dry_run:
         client = make_client(option, impl=impl, domain_list=domain_list)
         plan = []
-        for album_id in ids:
-            album = client.get_album_detail(album_id)
-            episodes = _safe(lambda: album.episode_list, []) or []
-            plan.append(
-                {
-                    "id": album_id,
-                    "title": _safe(lambda: album.name),
-                    "episodes": len(episodes),
-                    "images": _safe(lambda: album.page_count),
-                }
-            )
-        return {"dry_run": True, "dest": str(dest), "kind": "photo" if photo else "album", "plan": plan}
+        degraded = 0
+        for target_id in ids:
+            try:
+                if photo:
+                    # 章节（photo）模式：取章节详情，报页数
+                    detail = client.get_photo_detail(target_id)
+                    plan.append(
+                        {
+                            "id": target_id,
+                            "title": _safe(lambda: detail.name),
+                            "album_id": _safe(lambda: detail.album_id),
+                            "episodes": 1,
+                            "images": len(_safe(lambda: detail.page_arr, []) or []),
+                            "degraded": False,
+                        }
+                    )
+                else:
+                    album = client.get_album_detail(target_id)
+                    episodes = _safe(lambda: album.episode_list, []) or []
+                    plan.append(
+                        {
+                            "id": target_id,
+                            "title": _safe(lambda: album.name),
+                            "episodes": len(episodes),
+                            "images": _safe(lambda: album.page_count),
+                            "degraded": False,
+                        }
+                    )
+            except Exception as exc:
+                # 干跑只求「打算下什么」，取不到元数据不该让整条命令失败 ——
+                # 站点抽风、代理不通、本子被删都归到这里。
+                degraded += 1
+                plan.append(
+                    {
+                        "id": target_id,
+                        "title": None,
+                        "episodes": None,
+                        "images": None,
+                        "degraded": True,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+        return {
+            "dry_run": True,
+            "dest": str(dest),
+            "kind": "photo" if photo else "album",
+            "plan": plan,
+            "degraded": degraded,
+        }
 
     jm = _jmcomic()
     downloader = jm.download_photo if photo else jm.download_album
@@ -400,6 +478,28 @@ def download(
         raise _map_exception(exc, what="下载") from exc
 
     return _collect_download(result, dest=dest, kind="photo" if photo else "album")
+
+
+def _manifest_objects(dler) -> list[Any]:
+    """下载器上的文件清单对象列表。
+
+    ⚠ jmcomic 2.7.11 把清单放在 ``downloader.manifest_dict``（**按实体索引的 dict**），
+    **没有** ``downloader.manifest`` 这个属性。用错属性会得到「下载成功但 0 张图」的
+    **假成功** —— 图片其实已经在磁盘上，只是统计不出来。
+    """
+    manifest_dict = _safe(lambda: getattr(dler, "manifest_dict", None))
+    if isinstance(manifest_dict, dict) and manifest_dict:
+        return list(manifest_dict.values())
+    manifest = _safe(lambda: getattr(dler, "manifest", None))
+    return [manifest] if manifest is not None else []
+
+
+def _manifest_images(dler) -> list[str]:
+    """下载器实际写出的图片路径（跨所有实体清单合并）。"""
+    paths: list[str] = []
+    for manifest in _manifest_objects(dler):
+        paths.extend(_safe(lambda: manifest.image_filepath_list, []) or [])
+    return paths
 
 
 def _collect_download(result, *, dest: Path, kind: str) -> dict[str, Any]:
@@ -414,12 +514,13 @@ def _collect_download(result, *, dest: Path, kind: str) -> dict[str, Any]:
         except (TypeError, ValueError):  # pragma: no cover - 上游返回形态变化
             succeeded.append({"id": str(item)})
             continue
-        manifest = _safe(lambda: getattr(dler, "manifest", None))
-        paths = list(_safe(lambda: manifest.image_filepath_list, []) or [])
+        paths = _manifest_images(dler)
         files.extend(paths)
+        # 下载章节时第一个元素是「章节」实体（photo_id），下载本子时是「本子」实体
+        target_id = _safe(lambda: getattr(album, "photo_id", None)) or _safe(lambda: album.album_id)
         succeeded.append(
             {
-                "id": str(_safe(lambda: album.album_id)),
+                "id": str(target_id),
                 "title": _safe(lambda: album.name),
                 "images": len(paths),
             }
@@ -433,7 +534,9 @@ def _collect_download(result, *, dest: Path, kind: str) -> dict[str, Any]:
         "succeeded": succeeded,
         "failed": {str(k): str(v) for k, v in failed.items()},
         "file_count": len(files),
-        "files": files[:200],
+        # 只给样本：120 条路径会把 agent 的上下文冲爆（每本子 ≤ 30 次调用是硬指标）
+        "files": files[:20],
+        "files_truncated": len(files) > 20,
     }
 
 
@@ -464,6 +567,17 @@ def export(
             hint="可选：" + "、".join(EXPORT_FORMATS),
         )
 
+    missing = missing_modules(EXPORT_DEPENDENCIES.get(fmt, ()))
+    if missing:
+        installs = "、".join(f"uv pip install {_PIP_NAMES.get(m, m)}" for m in missing)
+        raise MangaError(
+            f"导出 {fmt} 缺少可选依赖：{'、'.join(missing)}",
+            code="DEP_MISSING",
+            exit_code=EXIT_ERROR,
+            hint=f"安装后重试：{installs}（CLI 不会自动安装）",
+            data={"format": fmt, "missing": missing},
+        )
+
     dest = ensure_safe_dest(dest, export_dir=export_dir, library_dir=library_dir)
     jm = _jmcomic()
 
@@ -482,13 +596,13 @@ def export(
         raise _map_exception(exc, what="导出") from exc
 
     album, dler = result
-    manifest = _safe(lambda: getattr(dler, "manifest", None))
     outputs: list[str] = []
-    for suffix in ("zip", "pdf", "png"):
-        try:
-            outputs.extend(manifest.get_export_filepath_list(suffix))
-        except Exception:  # pragma: no cover - 该格式没产出
-            continue
+    for manifest in _manifest_objects(dler):
+        for suffix in ("zip", "pdf", "png"):
+            try:
+                outputs.extend(manifest.get_export_filepath_list(suffix))
+            except Exception:  # pragma: no cover - 该格式没产出
+                continue
 
     return {
         "id": str(_safe(lambda: album.album_id)),
@@ -592,6 +706,16 @@ def _map_exception(exc: Exception, *, what: str) -> MangaError:
     name = type(exc).__name__
     message = str(exc)
     low = message.lower()
+
+    if isinstance(exc, ImportError):
+        module = getattr(exc, "name", None) or name
+        pip_name = _PIP_NAMES.get(module, module)
+        return MangaError(
+            f"{what}缺少可选依赖：{module}",
+            code="DEP_MISSING",
+            exit_code=EXIT_ERROR,
+            hint=f"uv pip install {pip_name}（CLI 不会自动安装）",
+        )
 
     if name == "MissingAlbumPhotoException":
         return MangaError(

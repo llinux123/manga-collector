@@ -36,7 +36,7 @@ manga-collector（本仓库）                  manga 工作区（另一个仓�
 # 0) 装环境
 uv venv; uv pip install -e ".[dev]"
 
-# 1) 体检（PowerShell / 脚本 / jmcomic / 代理端口 / 目录 / manga 工作区）
+# 1) 体检（PowerShell / 脚本 / jmcomic 导入 + 版本下限 / 登录态 / 可选依赖 / 代理端口 / 目录 / manga 工作区）
 manga doctor
 
 # 2) 看落点
@@ -112,7 +112,24 @@ Copy-Item -Recurse .agents\skills\manga "$env:USERPROFILE\.agents\skills\manga"
 | **P1** | jmcomic 适配层：search / album / comments / download / export / domains / pick-domain | ⏳ |
 | **P2** | 参考表补齐与校准 | ⏳ |
 | **P3** | gallery-dl / mangadex-downloader 适配器 + 长任务模型 + GitHub Actions 生成器 | ⏳ |
-| **P4** | 依赖探测、日志治理、装配与发布 | ⏳ |
+| **P4** | 加固（日志治理、依赖探测、优雅停机）、测试、装配与发布 | 🟡 进行中 |
+
+### P4 当前进度
+
+| 条目 | 状态 | 说明 |
+|---|---|---|
+| 日志治理 | ✅ | `download` / `export` 调 jmcomic 前切到 `<书库根>\Manga\Metadata\logs`；目录不可写时退到系统临时目录并给 warning，不再让命令崩掉 |
+| 依赖探测 | ✅ | `doctor` 报 `img2pdf` / `pillow` / `pyzipper` / `py7zr` / `pikepdf` / `gallery-dl` / `mangadex-dl` 缺哪些 —— **只给安装命令，绝不自动装** |
+| 版本下限校验 | ✅ | `doctor` 报 jmcomic 版本并与下限 `2.7.11` 比对（低版本会静默忽略 option 新字段） |
+| 登录态检查 | ✅ | 口径与 jmcomic 一致：`cookies` 非空 **且** 用户标识非空（api 看 `user_id`、html 看 `username`） |
+| 导出缺依赖的友好报错 | ✅ | 缺 `img2pdf` 等 → 退出码 2 + `uv pip install …` 提示，不再抛原始异常 |
+| 干跑降级 | ✅ | 取不到元数据时干跑降级为最小计划并给 `warnings`，不再整条命令失败 |
+| stdout 纯净性 | ✅ | jmcomic 的日志原本打在 stdout（会毁掉 JSON 信封），已改道 stderr；命令体里的意外 `print` 也被兜底改道 |
+| 增量校验 | ✅ | `manga verify --series <名>` 只校验指定系列 —— 存量库有历史问题时，全库闸门永远不是 0。选中的系列会复制进临时影子库根再验（原库零改动，验完即删）；支持嵌套系列（`18comic/繼母與繼姐`）与来源层自动摊平；`verify` 输出带 `series_available` |
+| 入库路径显式化 | ✅ | `ingest` 显式传 `-BackupRoot` / `-LogPath`，不再依赖 CWD（默认 `./backup` 会写进仓库根） |
+| 脚本输出透出 | ✅ | 脚本退出码 1 时把输出尾部放进 `warnings` —— 不再只丢一句「有冲突或告警」 |
+| `option.wait_all_plugins_finish()` | ⏳ | 退出前优雅停机（自定义异步插件用） |
+| `uv tool install` 打包 + 用户级 skill 安装 | ⏳ | `pyproject` 已有 console script，未做安装实测 |
 
 提交信息格式：`<类型>(P<阶段号>): <祈使句>`，例如 `feat(P1): jmcomic 适配层 —— 搜索/详情/下载/导出`。
 阶段分支 `p/<阶段号>-<短名>`，squash 合入 `main`，保证 `main` 历史里 **一个阶段 = 一个提交**。

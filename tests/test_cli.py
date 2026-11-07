@@ -100,6 +100,91 @@ class TestGuard:
         assert env["error"]["code"] == "RED_LINE"
 
 
+class TestVerifyScope:
+    """增量校验：存量库有历史问题时，用 --series 单独验新入库的那本。"""
+
+    def test_series_option_scopes_the_check(self, library_root: Path, scripts_dir: Path) -> None:
+        code, env = _invoke(
+            "verify",
+            "--library-root",
+            str(library_root),
+            "--scripts-dir",
+            str(scripts_dir),
+            "--series",
+            "Sample Series",
+        )
+        assert code == 0
+        assert env["ok"] is True
+        report = env["data"]["report"]
+        assert report["scanned"]["count"] == 2
+        assert report["naming_compliance"]["percent"] == 100.0
+        assert env["data"]["scoped_series"] == ["Sample Series"]
+
+    def test_original_library_is_untouched(self, library_root: Path, scripts_dir: Path) -> None:
+        before = sorted(p.name for p in (library_root / "Manga" / "Library").rglob("*"))
+        _invoke(
+            "verify",
+            "--library-root",
+            str(library_root),
+            "--scripts-dir",
+            str(scripts_dir),
+            "--series",
+            "Sample Series",
+        )
+        after = sorted(p.name for p in (library_root / "Manga" / "Library").rglob("*"))
+        assert after == before
+
+    def test_staging_directory_is_cleaned_up(self, library_root: Path, scripts_dir: Path) -> None:
+        metadata = library_root / "Manga" / "Metadata"
+        _invoke(
+            "verify",
+            "--library-root",
+            str(library_root),
+            "--scripts-dir",
+            str(scripts_dir),
+            "--series",
+            "Sample Series",
+        )
+        leftovers = [p.name for p in metadata.glob(".verify-scope-*")] if metadata.is_dir() else []
+        assert leftovers == [], f"临时影子库根没删干净：{leftovers}"
+
+    def test_series_available_is_reported(self, library_root: Path, scripts_dir: Path) -> None:
+        code, env = _invoke("verify", "--library-root", str(library_root), "--scripts-dir", str(scripts_dir))
+        assert code == 0
+        assert "Sample Series" in env["data"]["series_available"]
+
+    def test_missing_series_gives_actionable_error(self, library_root: Path, scripts_dir: Path) -> None:
+        code, env = _invoke(
+            "verify",
+            "--library-root",
+            str(library_root),
+            "--scripts-dir",
+            str(scripts_dir),
+            "--series",
+            "根本没有这个系列",
+        )
+        assert code == 4
+        assert env["error"]["code"] == "SERIES_MISSING"
+
+
+class TestDoctor:
+    def test_doctor_reports_version_auth_and_dependencies(self, library_root: Path) -> None:
+        code, env = _invoke("doctor", "--library-root", str(library_root))
+        assert code == 0
+        data = env["data"]
+        assert "jmcomic_version" in data
+        assert data["min_jmcomic_version"] == "2.7.11"
+        assert "logged_in" in data["auth"]
+        assert "missing_modules" in data["dependencies"]
+        assert "missing_executables" in data["dependencies"]
+
+    def test_doctor_checks_include_auth_and_dependency_checks(self, library_root: Path) -> None:
+        code, env = _invoke("doctor", "--library-root", str(library_root))
+        checks = {c["check"] for c in env["data"]["checks"]}
+        assert "auth" in checks
+        assert "jmcomic" in checks
+
+
 class TestMissingScript:
     def test_missing_script_gives_actionable_error(self, library_root: Path, workdir: Path) -> None:
         code, env = _invoke(

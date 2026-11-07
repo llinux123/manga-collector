@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 from .envelope import EXIT_CANCELLED, EXIT_ERROR, EXIT_NOTFOUND, EXIT_OK, EXIT_REFUSED, EXIT_USAGE, Envelope
 
