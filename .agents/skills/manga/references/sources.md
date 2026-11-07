@@ -1,6 +1,15 @@
 # 采集源选路（何时读我：用户要下载某个站点的漫画、或问「用什么工具下」时）
 
-> 版本核对日期 **2026-11-05**（GitHub Releases API / Codeberg API / 官方站点实抓）。
+> 版本核对日期 **2026-11-07**（GitHub Releases API / Codeberg API / 官方站点实抓）。
+>
+> **本机状态复核（2026-11-07）**：
+> - `gallery-dl` **已装 1.32.19**（scoop：`~/scoop/apps/gallery-dl/1.32.19`）✅ 与上表一致
+> - `mangadex-dl` **本机未安装**（P3 做适配器前要先装）
+> - `jmcomic` / `jmv` 已装（2.7.11）✅
+> - ⚠ `gallery-dl.exe --version` 在受限环境下会报
+>   `[PYI-xxxxx:ERROR] Failed to create parent directory structure.`
+>   —— PyInstaller 想在不可写的位置建目录。**不是坏了**，换个可写的工作目录即可；
+>   P3 的适配器要处理这个（先 chdir 到可写目录再调它）。
 
 ## 1. 选路矩阵
 
@@ -8,7 +17,7 @@
 |---|---|---|---|---|---|---|
 | **jmcomic** | 2.7.11 | Python CLI + API | 散图 → 需 `convert-cbz` | ❌ | ★★★★★（禁漫唯一解） | 禁漫天堂 / JM 系 |
 | **gallery-dl** | 1.32.19（上游已迁 Codeberg） | CLI | **直接产出 CBZ** | ❌ | ★★★★★（通用事实标准） | 绝大多数站点，268 分类 |
-| **mangadex-downloader** | 3.1.4 | CLI | `--save-as cbz` | ✅ **默认写** | ★★★★ | MangaDex 专项 |
+| **mangadex-downloader** | 3.1.4（**本机未安装**） | CLI | `--save-as cbz` | ✅ **默认写** | ★★★★ | MangaDex 专项 |
 | **FMD2** | 2.0.34.5 | GUI + Lua 模块 | 可选 CBZ/PDF/EPUB | 未核实 | ★★（人工） | gallery-dl 不收录的站；**需手动操作** |
 | **Kapowarr** | V1.3.2 | 服务端（*arr 式） | 系列/卷/期 CBZ | ❌ | ★★（人工） | 追更 + 种子场景；需 ComicVine API key |
 | ~~Suwayomi-Server~~ | v2.4.2366 | 服务端 + 扩展 | `downloadsPath` | 只读不写 | ✖ **排除** | ADR-011：需自备扩展仓库 + 常驻 JVM + PC 在线 |

@@ -62,6 +62,20 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 | `manga ingest` | 入库整理：重命名 + 写 ComicInfo.xml + 移入权威库 | **默认 dry-run**，要 `--apply` |
 | `manga convert-cbz` | jmcomic 散图 → `<编号> - <标题>.cbz`（图片平铺包根） | **默认 dry-run**，要 `--apply` |
 | `manga guard` | 红线守卫：查看/快照/比对共享区 `Export\Manga` | 只读（写快照文件除外） |
+| `manga job start <命令> [参数…]` | **后台**跑一个长任务，立刻返回 job id | 视被调命令而定 |
+| `manga job poll <job_id>` | 查作业状态（精简，秒回） | 否 |
+| `manga job cancel <job_id>` | 取消作业（**协作式**：写取消标记，子进程自己停下），给出已完成 / 未完成清单 | 是（终止下载） |
+| `manga job result <job_id>` | 作业最终摘要（子进程的信封 + 逐项结果） | 否 |
+| `manga job list` | 列出最近的作业 | 否 |
+| `manga favorites` | 导出收藏夹为 CSV（可选打 zip） | 是 |
+| `manga checkin` | 每日签到 | 是（写站点状态） |
+| `manga gallery-dl` | gallery-dl（通用站）：**默认预检**（判断 URL 支不支持），`--apply` 才下载 | **默认预检**，要 `--apply` |
+| `manga mangadex-dl` | MangaDex 专项：**默认预检**，`--apply` 才下载（产物 CBZ 带 ComicInfo.xml） | **默认预检**，要 `--apply` |
+| `manga actions-gen` | 生成 GitHub Actions workflow（download_dispatch + export_favorites）+ secrets 清单 | **默认 dry-run**，要 `--apply` |
+| `manga server check` | 探测 Komga / Kavita 是否可达（**网络失败不报错**，返回原因） | 否 |
+| `manga server libraries` | 列出 Komga 的书库（id / 名称 / 根路径） | 否 |
+| `manga server scan <库id>` | 触发 Komga 扫描某个书库（需 ADMIN；**只触发扫描**，不改元数据） | 是（触发服务端扫描） |
+| `manga server kavita-hint` | Kavita 的扫描**指引**（本项目不自动做） | 否 |
 
 常用参数：`--library-root`（书库根，默认 `%USERPROFILE%\Documents\Library`）、
 `--scripts-dir`（脚本目录）、`--report-path`（校验报告 CSV）、`--top-n`（问题条数）、
@@ -140,13 +154,41 @@ mangadex-dl --save-as cbz --path "$env:USERPROFILE\Documents\Library\00-Incoming
 
 ## 8. 进度与长任务
 
-- 下载大本子可能上百话：**不要一章一话地问用户**，一次确认整本，然后等结果。
+**下载大本子可能跑几分钟到几十分钟 —— 别用一条同步命令死等。** 用作业模型：
+
+```powershell
+manga job start download 404005 390442 --apply     # 立刻返回 job_id，不等
+manga job poll <job_id>                              # 几秒就回：state / 已完成几个 / 剩余几个
+manga job result <job_id>                            # 终态：子进程的信封 + 逐项结果
+manga job cancel <job_id>                            # 真能停：给已完成 / 未完成清单
+```
+
+| `job poll` 的 `state` | 含义 | 你怎么办 |
+|---|---|---|
+| `running` | 还在跑 | **等 15~30 秒再 poll 一次**，别高频轮询 |
+| `succeeded` | 成功 | 读 `job result`，然后跑 `manga verify` |
+| `failed` | 失败 | 读 `job result` 的 `error` / `stderr_tail` 再决定 |
+| `cancelled` | 被取消 | 读 `job result` 的 `done` / `failed`，告诉用户下到哪了 |
+
+**省调用次数的规矩**（硬指标：一次 2 话的真实下载，模型调用 ≤ 10 次）：
+
+1. 一次确认整本 / 整批，**不要**一章一话地问用户；
+2. `job start` 之后**只 poll 2~3 次**（每次间隔 ≥ 15 秒），不要 sleep 式轮询；
+3. 拿到终态就 `job result` 一次拿全，**不要**再去翻日志；
+4. 需要入库时：`convert-cbz` → `ingest` → `verify --series <名>`，**每步一次调用**。
+
+**作业取消是协作式的**：`job cancel` 只写一个取消标记，**子进程自己**看到后退出
+（受限环境里外部杀「别的进程创建出来的进程」常被拒 —— 沙箱、容器、CI 都这样）。
+所以取消后最多等几秒，作业就会变成 `cancelled`；`job result` 里能看到已完成/未完成清单。
+
 - jmcomic 的进度日志（`jmcomic-download.log`）是**相对路径**，落点=当前工作目录 →
   CLI 调 jmcomic 前会先切到 `<书库根>\Manga\Metadata\logs`，日志跟着走，**不会掉进仓库根**。
   自己直接跑 `jmcomic` 命令时同理：别在仓库根跑。
 - 断点续传：`download.cache: true`，中断后**重跑同一条命令**即可，已下的不会重来。
 - 干跑（`download` 不加 `--apply`）取不到元数据时**不会失败**，会降级成最小计划并在
   `warnings` 里提示 → `--apply` 之前先看警告。
+- 作业目录：`<书库根>\Manga\Metadata\jobs\<job_id>\`（`state.json` / `progress.json` /
+  `final.json` / `envelope.json` / `error.log`）。书库不可写时自动退到系统临时目录。
 
 ## 9. 参考资料（按需读，别一次全读）
 
@@ -159,6 +201,10 @@ mangadex-dl --save-as cbz --path "$env:USERPROFILE\Documents\Library\00-Incoming
 | 要设计文件夹名 / 写 ComicInfo | [references/naming.md](references/naming.md) |
 | 选采集源（禁漫 / gallery-dl / MangaDex / FMD2 / Kapowarr…） | [references/sources.md](references/sources.md) |
 | 服务端（Komga/Kavita）/ 阅读端 / 增强支线 | [references/servers.md](references/servers.md) |
+
+> references 里带 **【实测】/【源码】/【文档】** 标记的段落可信度不同：
+> 【文档】级的（html 端、收藏夹、签到、异步）**本机没验过**，用之前先小规模试。
+> 上游 jmcomic 升级后，用 `uv run python tools/jmcomic_facts.py check` 查 references 是否过期。
 
 ## 10. 红线之外的硬规则
 

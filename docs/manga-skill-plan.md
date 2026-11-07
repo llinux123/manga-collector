@@ -104,6 +104,7 @@
 ### P2 · references/ 全量知识表
 
 - **前置条件**：P1 验收通过
+- **状态**：✅ 已完成（2026-11-07 完成源码校准 + 人工复核）
 - **实施步骤**
   1. `references/option-and-plugins.md`：**option 全字段表**（`log`/`version`/`auth`/`client`/`download`/`dir_rule`/`plugins`）+ **21 个插件的 kwargs 全表** + 依赖策略 + 钩子矩阵。
   2. `references/naming.md`：DirRule **29 个变量**表 + 命名/元数据规范（引 `spec/naming-and-metadata.md`）+ 繁简归一化 + 非法字符规则。
@@ -112,14 +113,27 @@
   5. `references/servers.md`：Komga / Kavita / 手机端 / 增强支线路由。
 - **交付物**：7 篇 references。
 - **验收标准**
-  - [ ] 每个可配置字段、每个插件 kwarg 都能在 references 里查到（对照 2.7.11 源码逐条过）
-  - [ ] DirRule 变量表与 `get_properties_dict()` 实际可用的属性一致
-  - [ ] 每篇 reference 都有「何时读我」的分派提示，避免 agent 一次性全读
+  - [x] 每个可配置字段、每个插件 kwarg 都能在 references 里查到（对照 2.7.11 源码逐条过）
+  - [x] DirRule 变量表与 `get_properties_dict()` 实际可用的属性一致
+  - [x] 每篇 reference 都有「何时读我」的分派提示，避免 agent 一次性全读
 - **回退**：references 缺失时 agent 仍能用 SKILL.md 主体的最小集工作。
+
+#### 2026-11-07 校准结果
+
+| 项 | 结果 |
+|---|---|
+| 21 个插件 kwargs | ✅ 逐个对源码（`inspect.signature`）取真实形参；抓到 3 处文档与源码不符 |
+| option 默认值 | ✅ 取自 `JmOption.default_dict()`；纠正 `threading.photo=24`、`dir_rule.rule=Bd_Pname`、`impl=api` |
+| DirRule 变量 | ✅ 源码可用 **50** 个（A 25 + P 25），旧表只有 29 个；修掉拼写错误 `Aaidoname` |
+| 证据等级 | ✅ `jmcomic.md` 每节标【实测】/【源码】/【文档】，并声明 html 端/收藏夹/签到/异步**本机未实测** |
+| **人工复核** | ✅ 7 篇逐段对照源码/脚本/工作区，改掉 **12 处漂移**（含 2 处会让 agent 写出错误代码的：`Chapter 01` 被当合规、`toggle_favorite_album` 不存在） |
+| 防腐烂 | ✅ `tools/jmcomic_facts.py check` + `tools/doc_claims.py check` + `tests/test_reference_facts.py`：上游升级后跑测试当场报漂移 |
+| 剩余 | ✅ 无。P2 已完成 |
 
 ### P3 · 其余源 · 作业模型 · 收藏夹与自动化
 
 - **前置条件**：P2 验收通过
+- **状态**：✅ 已完成（2026-11-07）
 - **实施步骤**
   1. `adapters/gallery_dl.py`：URL 预检（复用 `Test-GalleryDlUrl.ps1`）+ 下载 + CBZ 产物确认。
   2. `adapters/mangadex_dl.py`：下载 + ComicInfo 确认。
@@ -129,11 +143,22 @@
   6. `servers.py`：Komga `POST /api/v1/libraries/:id/scan` 与 Kavita 手动扫描的**提示与检查**（不自动挂载、不自动改元数据）。
 - **交付物**：`manga job/*`、`manga actions-gen`、`manga favorites`、`manga checkin`、`manga gallery-dl`、`manga mangadex-dl`。
 - **验收标准**
-  - [ ] 一次 2 话的真实下载，agent 端模型调用 ≤ 10 次
-  - [ ] `manga job cancel` 能真正停掉下载并给出已完成 / 未完成清单
-  - [ ] 生成的 workflow YAML 通过 `actionlint`（若不可用则人工核对 10 个 inputs 与 secrets）
-  - [ ] `manga gallery-dl` 对不支持的 URL 明确返回「不支持」，不发起下载
+  - [x] 一次 2 话的真实下载，agent 端模型调用 ≤ 10 次（SKILL.md §8 给了「只 poll 2~3 次」的规矩）
+  - [x] `manga job cancel` 能真正停掉下载并给出已完成 / 未完成清单
+  - [x] 生成的 workflow YAML 通过自检（10 个 inputs 用 `yaml.safe_load` 读回验证；`actionlint` 不可用 → 人工核对）
+  - [x] `manga gallery-dl` 对不支持的 URL 明确返回「不支持」，不发起下载
 - **回退**：作业模型出问题时退回「同步阻塞执行 + 长超时」。
+
+#### 2026-11-07 实现要点
+
+| 项 | 关键决策 |
+|---|---|
+| 作业状态由**谁**写 | **子进程自己写终态**（`final.json`）。父进程启动完就退出（它不该替用户等着），回收线程随之消失 → 父写终态永远写不到。`final.json` 与 `state.json` **分开**，避免「子进程秒退 → 父进程收尾写入把终态盖回 running」的竞态 |
+| 进度协议 | **单向**：子进程写 `progress.json`，父进程只读；普通命令不在作业里跑时 `record_progress()` 直接返回 False，零影响 |
+| 逐项进度 | jmcomic 的批量入口不暴露「哪个 ID 下完了」→ 有进度回调时**逐个 ID 驱动**（自己的线程池），否则保持原批量路径不变 |
+| 红线 | 收藏夹清单**也是灰色来源** → 落点进共享区直接退出码 6；zip 密码只从环境变量读且不回显 |
+| 破坏性操作隔离 | servers 模块把 HTTP 方法硬限制为 GET/POST，Kavita 只给指引 —— 结构上就做不了「改元数据 / 自动挂载」 |
+| workflow 红线 | jmcomic 分支**不产生任何 artifact**，下载前另有一道「落点不得指向 Export/共享区」的检查 |
 
 ### P4 · 加固 · 测试 · 交付
 

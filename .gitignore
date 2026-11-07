@@ -11,6 +11,10 @@ dist/
 .pytest-tmp/
 .test-tmp/
 .pytest-cache/
+# 外部工具（PyInstaller 版 gallery-dl 等）的运行时解压目录 —— 正常跑完会自动清掉，
+# 但在受限环境里可能被 ACL 挡住删不掉，留个兜底
+.manga-tmp*/
+_MEI*/
 # 早前 tempfile.mkdtemp 留下的残骸（Windows 下 0o700 会套受限权限，需管理员权限删除）
 pytest-of-*/
 pytest-cache-files-*/

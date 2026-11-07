@@ -126,6 +126,15 @@ class Paths:
     def backups(self) -> Path:
         return self.library_root / "Backups" / "Manga"
 
+    @property
+    def jobs(self) -> Path:
+        """长任务作业目录：``manga job start`` 的状态、进度、日志都落在这里。
+
+        作业状态是**临时**的 —— 书库不可写时会退到系统临时目录（见
+        :func:`manga.jobs.JobStore.create`），不该因为落点不可写就整个失败。
+        """
+        return self.metadata / "jobs"
+
     # ── 脚本 ────────────────────────────────────────────────────────────
     def script(self, name: str) -> Path:
         """定位 PowerShell 脚本：先本项目，再 manga 工作区。"""
@@ -172,6 +181,7 @@ class Paths:
             "metadata": str(self.metadata),
             "logs": str(self.logs),
             "export": str(self.export),
+            "jobs": str(self.jobs),
             "scripts_dir": str(self.scripts_dir),
             "profile_dir": str(self.profile_dir),
             "workspace": str(self.workspace) if self.workspace else None,

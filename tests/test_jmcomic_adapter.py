@@ -135,7 +135,8 @@ class TestExportDependencies:
         with pytest.raises(MangaError) as excinfo:
             jm.export(object(), "123456", fmt="pdf", dest=library_root / "00-Incoming" / "_raw_jmcomic")
         assert excinfo.value.code == "DEP_MISSING"
-        assert excinfo.value.exit_code == EXIT_ERROR
+        # 缺依赖 = 「东西不存在」→ 退出码 4（与缺外部工具的 TOOL_MISSING 一致）
+        assert excinfo.value.exit_code == EXIT_NOTFOUND
         assert "img2pdf" in (excinfo.value.hint or "")
         assert "uv pip install" in (excinfo.value.hint or "")
 
@@ -147,7 +148,7 @@ class TestExportDependencies:
     def test_import_error_maps_to_dep_missing_with_hint(self) -> None:
         err = jm._map_exception(ImportError("No module named 'img2pdf'", name="img2pdf"), what="导出")
         assert err.code == "DEP_MISSING"
-        assert err.exit_code == EXIT_ERROR
+        assert err.exit_code == EXIT_NOTFOUND
         assert "uv pip install img2pdf" in (err.hint or "")
 
 

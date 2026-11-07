@@ -35,8 +35,8 @@
 ```
 
 - 纯数字话号补零到 **3 位**（`1` → `001`）；卷号补零到 2 位。同系列内宽度必须一致，否则报 `WidthInconsistent`。
-- 允许的写法：`01 - 标题`、`001 - 标题`、`Vol.3 - 标题`、`第01话 标题`、`Chapter 01`、`001-标题`。
-- 不合规：没有话号前缀（`chapter_two.cbz`）、话号含中文数字。
+- **合规**（用校验器正则实测）：`01 - 标题`、`001 - 标题`、`001-标题`、`Vol.3 - 标题`、`第01话 标题`、`12.5 - 标题`。
+- **违规**：没有数字话号前缀（`chapter_two.cbz`）、话号含中文数字、**`Chapter 01`**（编号必须以数字开头，英文 `Chapter` 不认）。
 - 非法字符按 F-05 替换：`/` → `／`，`:` → `：`，其余 `\*?"<>|` → `-`；Windows 保留名（`CON`/`COM1`…）前加 `_`。
 - **一话一个包**，包内图片**平铺在根目录**（不放子目录）。
 
@@ -59,13 +59,15 @@
 </ComicInfo>
 ```
 
-| 字段 | 要求 | 坑 |
+| 字段 | 校验器**实际**怎么查 | 坑 |
 |---|---|---|
-| `Series` | 与目录名**逐字一致** | 不一致报 `SeriesMismatch`（告警）；Kavita 会用元数据**覆盖**解析结果 |
-| `Number` | **必填**，纯数字 | 缺失报 `Metadata`；与文件名不符报 `NumberMismatch` → 排序错乱 + 被误判重复 |
-| `Volume` | 卷式命名填 | Komga 会把系列名改写成 `<Series> (<Volume>)` |
-| `Manga` | `Yes` / `YesAndRightToLeft` | **Komga 只认 `YesAndRightToLeft` 才 RTL**，写 `Yes` 不生效 |
-| `PageCount` | 图片页数 | 缺省时服务端可能算错 |
+| `ComicInfo.xml` | 缺失 → `Metadata` 错误；存在但**解析失败** → 也按「缺必填元数据」报错误 | 错误消息里列了 `Series/Number/Volume/Count/Manga/LanguageISO`，那是**举例文案**，不是逐字段校验 |
+| `Number` | **唯一逐字段必填**：为空 → `Metadata` 错误；与文件名编号做**数值**比对（`012`≡`12`） | 与文件名不符报 `NumberMismatch` → 排序错乱 + 被误判重复 |
+| `Series` | 与目录名不一致 → **告警** `SeriesMismatch`（不是错误） | Kavita 会用元数据**覆盖**解析结果 → 目录名与元数据不一致时，元数据说了算 |
+| `Volume` | **不校验**；只参与「重复判定」的组合键（Number+Volume）；卷式命名（`Vol.`/`Volume`/`卷` 前缀）跳过编号比对 | Komga 会把系列名改写成 `<Series> (<Volume>)` |
+| `Manga` | **不校验**（是阅读端的事） | **Komga 只认 `YesAndRightToLeft` 才 RTL**，写 `Yes` 不生效 |
+| `PageCount` | **不校验** | 缺省时服务端可能算错 |
+| `LanguageISO` | **不校验**；入库脚本按路径前缀推断，没命中就留空 | 空值会让阅读端的多语言筛选失效 |
 
 **服务端映射**：Komga 的 `Series` 取各书**最常见值**、`Publisher`/`Genre`/`LanguageISO` 同理；
 Kavita 把 `Number`→章号、`Volume`→卷、`Count`→完结状态、`Format`→Special、`SeriesGroup`→Collection、`StoryArc`→Reading List。
@@ -93,40 +95,71 @@ dir_rule:
 - `base_dir` 支持 `${ENV}`。
 - 本子根目录只保留 `Bd` 段和 `A` 开头的段（photo 级片段跳过）。
 
-### 变量表（29 个）
+### 变量表（源码可用 **50** 个）
 
-**本子（A 前缀，15 个）**
+> **校对日期：2026-11-07 · 对标 jmcomic 2.7.11 源码**。
+> 口径 = `JmBaseEntity.get_properties_dict()`：实例字段 + MRO 上的 property，
+> 按类名前缀取（`JmAlbumDetail` → `A`，`JmPhotoDetail` → `P`）。
+> 重新校对：`uv run python tools/jmcomic_facts.py dirrule`；
+> 漂移检查：`uv run python tools/jmcomic_facts.py check`。
+>
+> ⚠ 旧版本这张表只写了 29 个，**漏了一半** —— 漏的那些在下面「其余可用变量」里。
+
+**本子（A 前缀，25 个）**
 
 | 变量 | 含义 | 示例 |
 |---|---|---|
 | `{Aid}` / `{Aalbum_id}` | 本子 ID | `248965` |
 | `{Aname}` / `{Atitle}` | 本子标题（原始全名） | `喂我吃吧 老師! [欶瀾漢化組]` |
 | `{Aoname}` | 剥离标签后的原名 | `喂我吃吧 老師!` |
-| `{Aauthor}` | 第一作者 | `BLVEFO9` |
+| `{Aidoname}` | `[ID] 原名` | `[248965] 喂我吃吧 老師!` |
+| `{Aauthor}` | 第一作者（无作者时是默认值） | `BLVEFO9` |
+| `{Aauthors}` | 全部作者（列表） | `[BLVEFO9]` |
 | `{Aauthoroname}` | `【作者】原名` | `【BLVEFO9】喂我吃吧 老師!` |
-| `{Aaidoname}`→实为 `{Aidoname}` | `[ID] 原名` | `[248965] 喂我吃吧 老師!` |
 | `{Adescription}` | 简介 | |
+| `{Atags}` | 标签（列表） | |
+| `{Aactors}` | 登场人物（列表） | |
+| `{Aworks}` | 作品（列表） | |
 | `{Apage_count}` | 总页数（int） | `42` |
 | `{Apub_date}` | 发布日期 | `2023-01-15` |
 | `{Aupdate_date}` | 更新日期 | `2023-06-20` |
 | `{Alikes}` | 点赞数 | `1K` |
 | `{Aviews}` | 观看数 | `40K` |
 | `{Acomment_count}` | 评论数（int） | `128` |
+| `{Aepisode_list}` | 章节元组列表 `[photo_id, index, title, pub_date]` | ⚠ 内部结构，别用于命名 |
+| `{Arelated_list}` | 相关作品 ID 列表 | ⚠ 内部结构 |
+| `{Ais_favorite}` | 是否已收藏（bool） | ⚠ 内部状态 |
+| `{Aliked}` | 是否已点赞（bool） | ⚠ 内部状态 |
+| `{Aseries_id}` / `{Ascramble_id}` | 混淆相关 ID | ⚠ 内部字段，命名里用会得到乱码目录 |
 
-**章节（P 前缀，14 个）**
+**章节（P 前缀，25 个）**
 
 | 变量 | 含义 | 示例 |
 |---|---|---|
 | `{Pid}` / `{Pphoto_id}` | 章节 ID | `212214` |
 | `{Pname}` / `{Ptitle}` | 章节名 | `94 突然打來` |
 | `{Poname}` | 剥离标签后的章节原名 | `94 突然打來` |
+| `{Pidoname}` | `[ID] 章节原名` | |
 | `{Pauthor}` | 章节作者（优先取本子作者） | `BLVEFO9` |
 | `{Pauthoroname}` | `【作者】章节原名` | |
-| `{Pidoname}` | `[ID] 章节原名` | |
-| `{Psort}` | 章节排序值（int） | `3` |
 | `{Pindex}` / `{Palbum_index}` | 章节在本子中的序号（从 **1** 开始） | `3` |
 | `{Pindextitle}` | `第X話 章节名` | `第3話 94 突然打來` |
 | `{Palbum_id}` | 所属本子 ID | `248965` |
+| `{Psort}` | 章节排序值（int） | `3` |
+| `{Ppage_arr}` | 图片页数组 | ⚠ 内部结构 |
+| `{Pfrom_album}` | 所属本子实体 | ⚠ 内部结构 |
+| `{Pis_single_album}` | 是否「单章本子」 | ⚠ 内部状态 |
+| `{Pdata_original_0}` / `{Pdata_original_domain}` / `{Pdata_original_query_params}` | 混淆图片的原始信息 | ⚠ 内部字段 |
+| `{Pscramble_id}` / `{Pseries_id}` | 混淆/系列 ID | ⚠ 内部字段 |
+| `{Ptags}` / `{P_author}` / `{P_series_id}` / `{P_tags}` | 章节的标签/作者/系列（`_` 开头的是私有存储） | ⚠ 私有字段，别用 |
+
+**易错点**
+
+- `{Aaidoname}` **不存在**（旧文档写错过）—— 正确拼写是 `{Aidoname}`。
+- `{Pindex}` 与 `{Palbum_index}` 是**同一个值**（章节序号，1 起）；`{Pindextitle}` 才是 `第X話 名字`。
+- `Bd` 段不是字段，是落点根目录（`base_dir`）。
+- 段落以 `A`/`P` 开头 → 取对应实体的属性；其它（含 `{...}`）→ 按 f-string 解析。
+  两套混用时，**首段若不是 `Bd` 会自动补 `Bd` 在最前**。
 
 ### 实战 rule 样例
 

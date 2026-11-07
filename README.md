@@ -109,10 +109,67 @@ Copy-Item -Recurse .agents\skills\manga "$env:USERPROFILE\.agents\skills\manga"
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | **P0** | Skill 骨架 + 薄 CLI（paths/doctor/verify/ingest/convert-cbz/guard）+ 红线守卫 + 45 项测试 | ✅ 已提交 |
-| **P1** | jmcomic 适配层：search / album / comments / download / export / domains / pick-domain | ⏳ |
-| **P2** | 参考表补齐与校准 | ⏳ |
-| **P3** | gallery-dl / mangadex-downloader 适配器 + 长任务模型 + GitHub Actions 生成器 | ⏳ |
+| **P1** | jmcomic 适配层：search / album / comments / download / export / domains / pick-domain | ✅ 已提交（含一轮修复） |
+| **P2** | 参考表补齐与校准（21 个插件 kwargs / DirRule 变量 / 证据等级标注） | ✅ 已完成 |
+| **P3** | gallery-dl / mangadex-downloader 适配器 + 长任务模型 + GitHub Actions 生成器 | ✅ 已完成 |
 | **P4** | 加固（日志治理、依赖探测、优雅停机）、测试、装配与发布 | 🟡 进行中 |
+
+### P2 当前进度
+
+| 条目 | 状态 | 说明 |
+|---|---|---|
+| 21 个插件 kwargs 逐个对源码 | ✅ | 按 `inspect.signature` 逐个取真实形参，不再照文档抄；抓到 3 个文档与源码对不上的点（`zip` 依赖是动态的 / `long_img` 的 Pillow 是隐式依赖 / `jm_server` 的依赖源码没声明） |
+| option 默认值校准 | ✅ | 取自 `JmOption.default_dict()`，补上「上游默认值」表；纠正 `threading.photo=24`（不是 CPU 核数）、`dir_rule.rule` 默认 `Bd_Pname`、`impl` 默认 `api` |
+| DirRule 变量表 | ✅ | 源码可用 **50** 个（A 25 + P 25），旧表只有 29 个 —— 补齐漏掉的一半，并修掉历史拼写错误 `Aaidoname` → `Aidoname` |
+| 证据等级标注 | ✅ | `jmcomic.md` 每节标【实测】/【源码】/【文档】，并明确 html 端、收藏夹、签到、异步这几块**本机未实测** |
+| **人工复核** | ✅ | 7 篇 references 逐段对照源码/脚本/工作区，**改掉 12 处漂移**（见下表） |
+| **防腐烂工具** | ✅ | `tools/jmcomic_facts.py`（`plugins`/`dirrule`/`check`）+ `tools/doc_claims.py`（声明核对）+ `tests/test_reference_facts.py`：上游升级后跑测试就当场报漂移 |
+
+**人工复核改掉的 12 处漂移**
+
+| # | 文件 | 问题 | 依据 |
+|---|---|---|---|
+| 1 | pipeline.md | 乱码「# ① 打���」 | 文件被截断过 |
+| 2 | pipeline.md / naming.md | **`Chapter 01` 被列为「合规」** | 正则要求编号以数字开头 → 实为**违规** |
+| 3 | pipeline.md | LanguageISO 推断口径不全（漏 `cn`→zh-CN、`jp`→ja；实际扫**所有**路径段） | `Invoke-LibraryIngest.ps1` 的 `LanguageMap` |
+| 4 | naming.md | ComicInfo 表让人以为 Volume/Manga/PageCount/LanguageISO 都会被校验 | 校验器**只有 Number 是逐字段必填** |
+| 5 | troubleshooting.md | **`Bd_Atitle/Pname` 坏写法残留**（第 3 处） | 混用分隔符 → 字面量目录 |
+| 6 | troubleshooting.md | 「pytest 已配 `--basetemp`」 | 实际是 `conftest.py` 的 `workdir` fixture（避开 `\\?\` 前缀 + 0o700） |
+| 7 | troubleshooting.md / jmcomic.md | 「主程序退出前会调 `wait_all_plugins_finish()`」 | 上游**只定义、零调用点** → 得自己调 |
+| 8 | jmcomic.md | **`client.toggle_favorite_album()` 不存在** | 2.7.11 只有 `add_favorite_album` / `delete_favorite_album` |
+| 9 | jmcomic.md / troubleshooting.md | 并发模型过时（「默认可达 320 线程」） | 2.7.11 是**每层独立临时池** → 24×20=**480** |
+| 10 | sources.md | `mangadex-dl` 标成可用 | 本机**未安装**（P3 做适配器前要先装） |
+| 11 | sources.md | 漏了 gallery-dl 在受限环境的 PyInstaller 报错 | 实测 `[PYI-xxxxx:ERROR] Failed to create parent directory structure` |
+| 12 | servers.md | 版本号标着「实抓」但本轮没联网 | 诚实降级为「2026-11-05 快照，未复核」 |
+
+```powershell
+uv run python tools/jmcomic_facts.py plugins   # 21 个插件的源码事实表
+uv run python tools/jmcomic_facts.py dirrule   # DirRule 可用变量 + 与文档的差异
+uv run python tools/jmcomic_facts.py check     # 漂移检查（测试里也在跑）
+uv run python tools/doc_claims.py check        # 声明核对：API/常量/异常/脚本/正则/CLI 命令
+```
+
+### P3 当前进度
+
+| 条目 | 状态 | 说明 |
+|---|---|---|
+| **作业模型**（`manga job/*`） | ✅ | `start` 立刻返回 job id 并后台跑；`poll` 精简秒回；`cancel` 杀进程树并给**已完成 / 未完成**清单；`result` 拿子进程的信封。状态**由子进程自己写终态**（父进程启动完就退出，收不了尾）；`final.json` 与 `state.json` 分开以免互相覆盖 |
+| 作业取消 | ✅ | **协作式**：`job cancel` 只写取消标记，**子进程自己**看到后退出 —— 受限环境（沙箱/容器/CI）里外部杀「别的进程创建的进程」会被拒。实测：真实下载作业取消后子进程自行退出，`exited_by_itself=true` |
+| gallery-dl 适配层 | ✅ | `precheck()` 只模拟不落盘（`-s`），不支持的 URL 明确返回「不支持」；`download()` 递归找新增 CBZ，**0 产物报 NO_ARTIFACT**（防假成功）；识别 PyInstaller 的环境问题并与「URL 不支持」区分开（根因是 **TEMP 不可写**，不是 cwd） |
+| mangadex-downloader 适配层 | ✅ | `--save-as cbz` + 逐包检查 ComicInfo.xml；未安装时 TOOL_MISSING（退出码 4） |
+| 收藏夹 / 签到 | ✅ | 走 jmcomic 的 `favorite_folder_export` 插件；zip 密码**只从环境变量**读且不回显；收藏夹清单也是灰色来源 → 落点进共享区直接**红线拒绝（退出码 6）**；无登录态 → 退出码 3 |
+| GitHub Actions 生成器 | ✅ | `download_dispatch.yml`（**恰好 10 个 inputs**）+ `export_favorites.yml`（cron + 手动）；生成后自检 YAML；**jmcomic 分支不产生任何 artifact**（红线内建）；secrets 清单 12 项，只有名字与说明 |
+| 服务端扫描助手 | ✅ | Komga：探活 / 列库 / 触发扫描（需 ADMIN）；Kavita：**只给指引**，本项目不自动做；HTTP 方法硬限制为 GET/POST，结构上无法改元数据 |
+| 验收 | ✅ | 一次 2 话的真实下载，agent 端模型调用 ≤ 10 次（SKILL.md §8 给了轮询规矩）；`job cancel` 真能停；生成的 YAML 通过自检（10 inputs 用 `yaml.safe_load` 读回验证）；不支持的 URL 明确返回「不支持」且不下载 |
+
+```powershell
+manga job start download 404005 390442 --apply   # 立刻返回 job_id
+manga job poll <job_id>                            # 几秒就回
+manga job result <job_id>                          # 终态摘要
+manga job cancel <job_id>                          # 真能停
+manga gallery-dl "<URL>"                           # 预检：支不支持
+manga actions-gen                                  # 生成 workflow（dry-run）
+```
 
 ### P4 当前进度
 
@@ -122,7 +179,7 @@ Copy-Item -Recurse .agents\skills\manga "$env:USERPROFILE\.agents\skills\manga"
 | 依赖探测 | ✅ | `doctor` 报 `img2pdf` / `pillow` / `pyzipper` / `py7zr` / `pikepdf` / `gallery-dl` / `mangadex-dl` 缺哪些 —— **只给安装命令，绝不自动装** |
 | 版本下限校验 | ✅ | `doctor` 报 jmcomic 版本并与下限 `2.7.11` 比对（低版本会静默忽略 option 新字段） |
 | 登录态检查 | ✅ | 口径与 jmcomic 一致：`cookies` 非空 **且** 用户标识非空（api 看 `user_id`、html 看 `username`） |
-| 导出缺依赖的友好报错 | ✅ | 缺 `img2pdf` 等 → 退出码 2 + `uv pip install …` 提示，不再抛原始异常 |
+| 导出缺依赖的友好报错 | ✅ | 缺 `img2pdf` 等 → 退出码 **4**（缺东西，与缺外部工具 `TOOL_MISSING` 一致）+ `uv pip install …` 提示，不再抛原始异常 |
 | 干跑降级 | ✅ | 取不到元数据时干跑降级为最小计划并给 `warnings`，不再整条命令失败 |
 | stdout 纯净性 | ✅ | jmcomic 的日志原本打在 stdout（会毁掉 JSON 信封），已改道 stderr；命令体里的意外 `print` 也被兜底改道 |
 | 增量校验 | ✅ | `manga verify --series <名>` 只校验指定系列 —— 存量库有历史问题时，全库闸门永远不是 0。选中的系列会复制进临时影子库根再验（原库零改动，验完即删）；支持嵌套系列（`18comic/繼母與繼姐`）与来源层自动摊平；`verify` 输出带 `series_available` |

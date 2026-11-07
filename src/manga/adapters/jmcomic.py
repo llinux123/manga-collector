@@ -22,7 +22,7 @@ from __future__ import annotations
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from ..envelope import EXIT_AUTH, EXIT_ERROR, EXIT_NOTFOUND, MangaError, RedLineViolation
 from ..runtime import missing_modules, route_jm_logs_to_stderr
@@ -82,7 +82,7 @@ def _jmcomic():
         raise MangaError(
             "未安装 jmcomic",
             code="DEP_MISSING",
-            exit_code=EXIT_ERROR,
+            exit_code=EXIT_NOTFOUND,
             hint="uv pip install 'jmcomic>=2.7.11'",
         ) from exc
     # jmcomic 默认把日志打在 stdout → 会污染 JSON 信封，先改道到 stderr
@@ -405,11 +405,15 @@ def download(
     login: bool = True,
     impl: str | None = None,
     domain_list: Sequence[str] | None = None,
+    on_progress: Callable[[str, str, str | None], None] | None = None,
 ) -> dict[str, Any]:
     """下载本子（或章节）。
 
     * ``dry_run``：只解析章节数与图片数，不落盘；
-    * 落点由 ``dest`` 决定，红线目录一律拒绝。
+    * 落点由 ``dest`` 决定，红线目录一律拒绝；
+    * ``on_progress``：给了就**逐个 ID 驱动**并回调 ``(事件, id, 错误信息)``，
+      事件 ∈ ``done`` / ``failed``。作业模型需要「哪个 ID 下完了」才能在取消时
+      给出「已完成 / 未完成」清单 —— 上游的批量入口不暴露这个信息。
     """
     dest = ensure_safe_dest(dest, export_dir=export_dir, library_dir=library_dir)
     ids = [str(i) for i in ids]
@@ -471,13 +475,44 @@ def download(
 
     jm = _jmcomic()
     downloader = jm.download_photo if photo else jm.download_album
+    kind = "photo" if photo else "album"
 
-    try:
-        result = downloader(ids, option, check_exception=False, login=login)
-    except Exception as exc:
-        raise _map_exception(exc, what="下载") from exc
+    if on_progress is None:
+        try:
+            result = downloader(ids, option, check_exception=False, login=login)
+        except Exception as exc:
+            raise _map_exception(exc, what="下载") from exc
+        return _collect_download(result, dest=dest, kind=kind)
 
-    return _collect_download(result, dest=dest, kind="photo" if photo else "album")
+    # ── 逐个 ID 驱动（作业模式） ──
+    # 上游批量入口把「每个 ID 一个线程」藏在 download_batch 里，不回调完成情况；
+    # 这里改成自己开池子逐个驱动，好让作业模型知道进度。
+    if login and option.auth.get("username") and option.auth.get("password"):
+        try:
+            option.login_with_option_auth()  # 幂等：已登录会直接跳过
+        except Exception:  # noqa: BLE001 - 登录失败不致命，真正的错在下载阶段
+            pass
+
+    def _one(target_id: str):
+        try:
+            return target_id, downloader([target_id], option, check_exception=False, login=False), None
+        except Exception as exc:  # noqa: BLE001 - 逐项隔离：一个失败不影响别的
+            return target_id, None, exc
+
+    items: list[Any] = []
+    failures: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(len(ids), 8))) as pool:
+        futures = {pool.submit(_one, target_id): target_id for target_id in ids}
+        for future in as_completed(futures):
+            target_id, result, error = future.result()
+            if error is not None:
+                failures[target_id] = error
+                on_progress("failed", target_id, f"{type(error).__name__}: {error}")
+                continue
+            items.extend(list(result))
+            on_progress("done", target_id, None)
+
+    return _summarize(items, failures, dest=dest, kind=kind)
 
 
 def _manifest_objects(dler) -> list[Any]:
@@ -505,10 +540,25 @@ def _manifest_images(dler) -> list[str]:
 def _collect_download(result, *, dest: Path, kind: str) -> dict[str, Any]:
     """把 jmcomic 的下载结果整理成稳定的 dict。"""
     failed = dict(_safe(lambda: getattr(result, "failed", None), {}) or {})
+    return _summarize(list(result), failed, dest=dest, kind=kind)
+
+
+def _summarize(
+    items: list[Any],
+    failed: dict[str, Any],
+    *,
+    dest: Path,
+    kind: str,
+) -> dict[str, Any]:
+    """把「(实体, downloader) 列表 + 失败表」汇总成稳定的 dict。
+
+    抽出来是因为逐个 ID 驱动时（作业模型要逐项进度），每个 ID 各拿一个
+    BatchResult，得先把它们合并再汇总。
+    """
     succeeded: list[dict[str, Any]] = []
     files: list[str] = []
 
-    for item in result:
+    for item in items:
         try:
             album, dler = item
         except (TypeError, ValueError):  # pragma: no cover - 上游返回形态变化
@@ -573,7 +623,7 @@ def export(
         raise MangaError(
             f"导出 {fmt} 缺少可选依赖：{'、'.join(missing)}",
             code="DEP_MISSING",
-            exit_code=EXIT_ERROR,
+            exit_code=EXIT_NOTFOUND,
             hint=f"安装后重试：{installs}（CLI 不会自动安装）",
             data={"format": fmt, "missing": missing},
         )
@@ -713,7 +763,7 @@ def _map_exception(exc: Exception, *, what: str) -> MangaError:
         return MangaError(
             f"{what}缺少可选依赖：{module}",
             code="DEP_MISSING",
-            exit_code=EXIT_ERROR,
+            exit_code=EXIT_NOTFOUND,
             hint=f"uv pip install {pip_name}（CLI 不会自动安装）",
         )
 

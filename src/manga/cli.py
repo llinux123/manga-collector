@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 import socket
 import sys
@@ -23,10 +24,17 @@ from typing import Any
 import typer
 
 from . import __version__
+from . import actions_gen
+from . import favorites as favorites_mod
+from . import jobs
+from . import servers
+from .adapters import gallery_dl
 from .adapters import jmcomic as jm_adapter
+from .adapters import mangadex_dl
 from .adapters import pipeline
-from .config import ENV_WORKSPACE, Paths, resolve_paths
+from .config import ENV_LIBRARY_ROOT, ENV_WORKSPACE, Paths, resolve_paths
 from .envelope import (
+    EXIT_CANCELLED,
     EXIT_ERROR,
     EXIT_NOTFOUND,
     EXIT_OK,
@@ -61,20 +69,58 @@ def _timestamp() -> str:
 
 def _run(command: str, fn) -> None:
     """执行命令并统一处理异常 → 信封。"""
+    _start_cancel_watchdog()
     try:
         # stdout 只允许出现信封：命令体里任何意外的 print 都改道 stderr
         with contextlib.redirect_stdout(sys.stderr):
             env = fn()
     except MangaError as exc:
-        raise typer.Exit(code=emit(exc.to_envelope())) from exc
+        env = exc.to_envelope()
+        _finalize_job(env)
+        raise typer.Exit(code=emit(env)) from exc
     except Exception as exc:  # noqa: BLE001 - 兜底：不让异常裸奔到 agent
         env = Envelope(
             ok=False,
             error={"code": "UNEXPECTED", "message": f"{type(exc).__name__}: {exc}", "hint": None},
             exit=EXIT_ERROR,
         )
+        _finalize_job(env)
         raise typer.Exit(code=emit(env)) from exc
+    _finalize_job(env)
     raise typer.Exit(code=emit(env))
+
+
+def _start_cancel_watchdog() -> None:
+    """在作业里跑时，盯着「取消标记」，看到就自己退出。
+
+    协作式取消 —— 不用外部去杀进程（受限环境里外部杀法常被拒）。
+    """
+    job_dir = os.environ.get(jobs.ENV_JOB_DIR)
+    if not job_dir:
+        return
+    try:
+        jobs.start_cancel_watchdog(Path(job_dir))
+    except Exception:  # noqa: BLE001 - 看门狗起不来不该影响命令本身
+        pass
+
+
+def _finalize_job(env: Envelope) -> None:
+    """在作业里跑时，把终态写进 ``final.json``（不在作业里就是空操作）。
+
+    父进程启动完作业就退出了，没法替子进程收尾 —— 终态只能由**子进程自己**写。
+    """
+    try:
+        jobs.finalize(
+            {
+                "ok": env.ok,
+                "data": env.data,
+                "error": env.error,
+                "warnings": env.warnings,
+                "exit": env.exit,
+            }
+        )
+    except Exception:  # noqa: BLE001 - 写终态失败不该影响命令本身
+        pass
 
 
 def _stage_series_for_verify(p: Paths, series: list[str]) -> Path:
@@ -728,7 +774,12 @@ def download(
                 dry_run=not apply,
                 login=login,
                 impl=impl,
+                on_progress=_job_progress,
             )
+
+        # 作业模式（manga job start download …）：先把条目登记进去，
+        # 这样即使中途被取消，也知道「要下哪几个、已完成哪几个」
+        jobs.record_progress(items=[str(i) for i in ids], message=f"开始下载 {len(ids)} 个 ID")
 
         # 日志治理：jmcomic 的进度日志是相对路径 → 先切到固定日志目录
         data, warnings = _run_in_log_dir(p, _do)
@@ -837,6 +888,511 @@ def version() -> None:
         return Envelope(ok=True, data={"version": __version__})
 
     _run("version", run)
+
+
+# ── 收藏夹 / 签到（P3） ───────────────────────────────────────────────────
+
+
+@app.command()
+def favorites(
+    dest: str | None = typer.Option(None, "--dest", help="落点（默认 <library-root>\\Manga\\Metadata\\favorites）"),
+    make_zip: bool = typer.Option(False, "--zip", help="额外打一个 zip"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """导出收藏夹为 CSV（每个收藏夹一个文件），可选再打一个 zip。
+
+    ⚠ 收藏夹是**灰色来源的书单** → 落点不得是共享区（红线，退出码 6）。
+    ⚠ 加密 zip 的密码只从环境变量 ``MANGA_ZIP_PASSWORD`` 读，不接受命令行明文。
+    需要登录态（退出码 3）。
+    """
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        target = (
+            Path(dest).expanduser().resolve()
+            if dest
+            else (p.metadata / "favorites").resolve()
+        )
+        option = _jm_option(p)
+        data, warnings = _run_in_log_dir(
+            p,
+            lambda: favorites_mod.export_favorites(
+                option,
+                dest=target,
+                export_dir=p.export,
+                library_dir=p.library,
+                zip_enable=make_zip,
+                zip_password=os.environ.get(favorites_mod.ENV_ZIP_PASSWORD),
+            ),
+        )
+        return Envelope(ok=True, data=data, warnings=warnings)
+
+    _run("favorites", run)
+
+
+@app.command()
+def checkin(
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """每日签到。``code`` 0 = 成功，1 = 今天已经签过。需要登录态（退出码 3）。"""
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        option = _jm_option(p)
+        data, warnings = _run_in_log_dir(p, lambda: favorites_mod.checkin(option))
+        if data.get("already_checked_in"):
+            warnings.append("今天已经签过过了")
+        return Envelope(ok=True, data=data, warnings=warnings)
+
+    _run("checkin", run)
+
+
+# ── 外部下载器（P3） ──────────────────────────────────────────────────────
+
+
+@app.command("gallery-dl")
+def gallery_dl_cmd(
+    urls: list[str] = typer.Argument(..., help="要下载的 URL（可多个）"),
+    dest: str | None = typer.Option(None, "--dest", help="落点（默认 <library-root>\\00-Incoming\\Manga）"),
+    apply: bool = typer.Option(False, "--apply", help="真正下载；不加就是**预检**（只模拟，不落盘）"),
+    timeout: float = typer.Option(120.0, "--timeout", help="单次命令超时（秒）"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """gallery-dl（通用站的事实标准，直接产出 CBZ）。
+
+    **默认预检**：`gallery-dl -s` 只模拟、不落盘 → 判断这个 URL 站不支持。
+    不支持的 URL 明确返回「不支持」（退出码 4），**不会**发起下载。
+    加 ``--apply`` 才真下载。落点同样受红线约束。
+    """
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        target = Path(dest).expanduser().resolve() if dest else p.inbox.resolve()
+
+        if not apply:
+            checks = [gallery_dl.precheck(url, timeout=timeout) for url in urls]
+            unsupported = [c for c in checks if not c.get("supported")]
+            data = {
+                "dry_run": True,
+                "dest": str(target),
+                "checks": checks,
+                "supported_count": len(checks) - len(unsupported),
+                "unsupported_count": len(unsupported),
+            }
+            if unsupported:
+                raise MangaError(
+                    "gallery-dl 不支持这些 URL：" + "、".join(str(c.get("url")) for c in unsupported),
+                    code="UNSUPPORTED_URL",
+                    exit_code=EXIT_NOTFOUND,
+                    hint="换源，或人工用 FMD2；详见 references/sources.md",
+                    data=data,
+                )
+            return Envelope(ok=True, data=data, warnings=["dry-run：未加 --apply，未下载任何文件"])
+
+        data = gallery_dl.download(
+            urls,
+            target,
+            export_dir=p.export,
+            library_dir=p.library,
+            timeout=timeout if timeout >= 3600 else 3600.0,
+        )
+        return Envelope(ok=True, data=data)
+
+    _run("gallery-dl", run)
+
+
+@app.command("mangadex-dl")
+def mangadex_dl_cmd(
+    url: str = typer.Argument(..., help="MangaDex 的作品 URL"),
+    dest: str | None = typer.Option(None, "--dest", help="落点（默认 <library-root>\\00-Incoming\\Manga）"),
+    language: str | None = typer.Option(None, "--language", help="语言过滤（如 zh；留空 = 不限）"),
+    apply: bool = typer.Option(False, "--apply", help="真正下载；不加就是**预检**（只查工具与计划）"),
+    timeout: float = typer.Option(3600.0, "--timeout", help="超时（秒）"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """mangadex-downloader（MangaDex 专项，默认写 ComicInfo.xml）。
+
+    **默认预检**：只确认工具在不在、计划怎么跑，不下载。
+    加 ``--apply`` 才真下载（产物是 CBZ，带 ComicInfo.xml）。
+    """
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        target = Path(dest).expanduser().resolve() if dest else p.inbox.resolve()
+
+        if not apply:
+            exe = mangadex_dl.find_executable()  # 找不到会抛 TOOL_MISSING（退出码 4）
+            return Envelope(
+                ok=True,
+                data={
+                    "dry_run": True,
+                    "dest": str(target),
+                    "url": url,
+                    "language": language,
+                    "executable": str(exe),
+                    "command": f"mangadex-dl --save-as cbz --path {target}"
+                    + (f" --language {language}" if language else "")
+                    + f" {url}",
+                },
+                warnings=["dry-run：未加 --apply，未下载任何文件"],
+            )
+
+        data = mangadex_dl.download(
+            url,
+            target,
+            language=language,
+            export_dir=p.export,
+            library_dir=p.library,
+            timeout=timeout,
+        )
+        return Envelope(ok=True, data=data)
+
+    _run("mangadex-dl", run)
+
+
+# ── 自动化（P3） ──────────────────────────────────────────────────────────
+
+
+@app.command("actions-gen")
+def actions_gen_cmd(
+    dest: str | None = typer.Option(None, "--dest", help="仓库根目录（workflow 写进 <dest>/.github/workflows）"),
+    apply: bool = typer.Option(False, "--apply", help="真正写盘；不加只报告将要写什么"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+    scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
+) -> None:
+    """生成 GitHub Actions workflow（download_dispatch.yml + export_favorites.yml）。
+
+    **默认 dry-run**：只报告将要写哪些文件；``--apply`` 才落盘。
+    同时返回 secrets 清单（只有名字与说明，不含任何凭据）。
+    """
+
+    def run() -> Envelope:
+        p = _paths(library_root, scripts_dir)
+        root = Path(dest).expanduser().resolve() if dest else Path.cwd()
+        data = actions_gen.write_workflows(root, apply=apply)
+        data["secrets"] = actions_gen.secrets_manifest()
+        data["validation"] = actions_gen.validate_workflows()
+        if not data["validation"]["ok"]:
+            raise MangaError(
+                "生成的 workflow 没通过自检",
+                code="WORKFLOW_INVALID",
+                exit_code=EXIT_ERROR,
+                data=data,
+            )
+        return Envelope(
+            ok=True,
+            data=data,
+            warnings=[] if apply else ["dry-run：未加 --apply，没有写任何文件"],
+        )
+
+    _run("actions-gen", run)
+
+
+server_app = typer.Typer(help="服务端（Komga / Kavita）扫描助手：只读探测 + 扫描触发")
+app.add_typer(server_app, name="server")
+
+
+def _server_auth() -> tuple[tuple[str, str] | None, str | None]:
+    """服务端的凭据只从**环境变量**读（不落命令行历史）。"""
+    user = os.environ.get("KOMGA_USERNAME")
+    password = os.environ.get("KOMGA_PASSWORD")
+    auth = (user, password) if user and password else None
+    return auth, os.environ.get("KOMGA_API_KEY")
+
+
+@server_app.command("check")
+def server_check(
+    base_url: str | None = typer.Option(None, "--base-url", help="服务地址（默认读 KOMGA_BASE_URL / KAVITA_BASE_URL）"),
+    timeout: float = typer.Option(8.0, "--timeout"),
+) -> None:
+    """探测服务端是否可达。**网络失败不报错**，返回 reachable=false + 原因。"""
+
+    def run() -> Envelope:
+        url = base_url or os.environ.get("KOMGA_BASE_URL") or os.environ.get("KAVITA_BASE_URL")
+        if not url:
+            raise MangaError(
+                "没给服务地址",
+                code="NO_BASE_URL",
+                exit_code=EXIT_USAGE,
+                hint="用 --base-url，或设 KOMGA_BASE_URL / KAVITA_BASE_URL",
+            )
+        auth, api_key = _server_auth()
+        data = servers.check_server(url, auth=auth, api_key=api_key, timeout=timeout)
+        warnings = [] if data.get("reachable") else [f"服务端不可达：{data.get('reason')}"]
+        return Envelope(ok=True, data=data, warnings=warnings)
+
+    _run("server check", run)
+
+
+@server_app.command("libraries")
+def server_libraries(
+    base_url: str | None = typer.Option(None, "--base-url"),
+    timeout: float = typer.Option(8.0, "--timeout"),
+) -> None:
+    """列出 Komga 的书库（id / 名称 / 根路径）—— 挑一个来扫描。"""
+
+    def run() -> Envelope:
+        url = base_url or os.environ.get("KOMGA_BASE_URL")
+        if not url:
+            raise MangaError(
+                "没给服务地址",
+                code="NO_BASE_URL",
+                exit_code=EXIT_USAGE,
+                hint="用 --base-url，或设 KOMGA_BASE_URL",
+            )
+        auth, api_key = _server_auth()
+        return Envelope(ok=True, data=servers.komga_libraries(url, auth=auth, api_key=api_key, timeout=timeout))
+
+    _run("server libraries", run)
+
+
+@server_app.command("scan")
+def server_scan(
+    library_id: str = typer.Argument(..., help="要扫描的书库 id"),
+    base_url: str | None = typer.Option(None, "--base-url"),
+    timeout: float = typer.Option(8.0, "--timeout"),
+) -> None:
+    """触发 Komga 扫描某个书库（``POST /api/v1/libraries/:id/scan``）。
+
+    需要 ADMIN 权限。**只触发扫描**，不改任何元数据。
+    """
+
+    def run() -> Envelope:
+        url = base_url or os.environ.get("KOMGA_BASE_URL")
+        if not url:
+            raise MangaError(
+                "没给服务地址",
+                code="NO_BASE_URL",
+                exit_code=EXIT_USAGE,
+                hint="用 --base-url，或设 KOMGA_BASE_URL",
+            )
+        auth, api_key = _server_auth()
+        data = servers.trigger_komga_scan(url, library_id, auth=auth, api_key=api_key, timeout=timeout)
+        return Envelope(ok=True, data=data)
+
+    _run("server scan", run)
+
+
+@server_app.command("kavita-hint")
+def server_kavita_hint(
+    base_url: str | None = typer.Option(None, "--base-url"),
+    library_path: str | None = typer.Option(None, "--library-path", help="Kavita 里的书库路径"),
+) -> None:
+    """Kavita 的扫描**指引**（本项目不自动做 —— Kavita 没有等价的公开扫描 API）。"""
+
+    def run() -> Envelope:
+        url = base_url or os.environ.get("KAVITA_BASE_URL")
+        return Envelope(ok=True, data=servers.kavita_scan_hint(url, library_path=library_path))
+
+    _run("server kavita-hint", run)
+
+
+# ── 作业模型（P3） ────────────────────────────────────────────────────────
+
+job_app = typer.Typer(
+    help="长任务作业模型：start / poll / cancel / result（下载这类慢命令别阻塞等）",
+    no_args_is_help=True,
+)
+app.add_typer(job_app, name="job")
+
+
+def _job_store(library_root: str | None = None) -> jobs.JobStore:
+    """作业目录：优先书库里，退到系统临时目录。"""
+    p = _paths(library_root, None)
+    return jobs.JobStore.create([p.jobs, Path(tempfile.gettempdir()) / "manga-jobs"])
+
+
+def _infer_items(args: list[str]) -> list[str]:
+    """从透传参数里推断「作业条目」。
+
+    取**第一个 ``-`` 开头参数之前**的位置参数 —— 那通常是 ID 列表
+    （``manga job start download 404005 390442 --apply``）。
+    推断不准也不要紧：``--item`` 可以显式指定，进度只是给人看的。
+    """
+    items: list[str] = []
+    for token in args:
+        if token.startswith("-"):
+            break
+        items.append(token)
+    return items
+
+
+def _job_progress(event: str, item_id: str, error: str | None) -> None:
+    """下载进度回调：写进作业的 progress.json。
+
+    不在作业里跑时 :func:`jobs.record_progress` 直接返回 False —— 普通命令不受影响。
+    """
+    if event == "done":
+        jobs.record_progress(done=[item_id], message=f"已完成 {item_id}")
+    elif event == "failed":
+        jobs.record_progress(failed=[item_id], message=f"{item_id} 失败：{error}")
+
+
+def _known_commands() -> list[str]:
+    """CLI 已注册的命令名（供 `job start` 校验用）。
+
+    ``@app.command()`` 不带名字时，typer 用函数名注册 —— 那些也要算进去。
+    """
+    names: set[str] = set()
+    for info in app.registered_commands:
+        name = info.name or getattr(info.callback, "__name__", "")
+        if name:
+            names.add(name.replace("_", "-"))
+    return sorted(names)
+
+
+@job_app.command("start", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+def job_start(
+    ctx: typer.Context,
+    command: str = typer.Argument(..., help="要跑的命令：download / ingest / verify / convert-cbz …"),
+    item: list[str] = typer.Option(None, "--item", help="作业条目（可重复）；不给则从位置参数推断"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+) -> None:
+    """后台启动一个长任务，**立刻返回 job id**（不等待）。
+
+    剩余参数原样透传给子命令::
+
+        manga job start download 404005 390442 --apply
+    """
+
+    def run() -> Envelope:
+        known = _known_commands()
+        if command not in known:
+            raise MangaError(
+                f"没有这个命令：{command}",
+                code="UNKNOWN_COMMAND",
+                exit_code=EXIT_USAGE,
+                hint="可用命令：" + "、".join(known),
+            )
+        store = _job_store(library_root)
+        extra = list(ctx.args)
+        # 书库根用**环境变量**传给子进程，而不是拼命令行参数 ——
+        # 不是每个命令都认 `--library-root`（`version` 就不认），拼上去会让子进程直接用法错。
+        env_extra = {}
+        if library_root:
+            env_extra[ENV_LIBRARY_ROOT] = str(Path(library_root).expanduser().resolve())
+        items = list(item) if item else _infer_items(ctx.args)
+        state = jobs.start(store, command, extra, items=items, env_extra=env_extra)
+        return Envelope(
+            ok=True,
+            data={
+                "job_id": state.id,
+                "state": state.state,
+                "command": state.command,
+                "argv": state.argv,
+                "pid": state.pid,
+                "items": items,
+                "poll_hint": f"manga job poll {state.id}",
+                "jobs_dir": str(store.root),
+            },
+            warnings=[f"作业已在后台启动；用 `manga job poll {state.id}` 低频轮询，别一直等"],
+        )
+
+    _run("job start", run)
+
+
+@job_app.command("poll")
+def job_poll(
+    job_id: str = typer.Argument(..., help="作业 id"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+) -> None:
+    """查作业状态 —— **精简**，几秒就返回，可以低频轮询。"""
+
+    def run() -> Envelope:
+        store = _job_store(library_root)
+        data = jobs.poll(store, job_id)
+        warnings: list[str] = []
+        if data["state"] == jobs.STATE_FAILED:
+            warnings.append("作业失败 —— 用 `manga job result` 看完整结果")
+        return Envelope(ok=True, data=data, warnings=warnings)
+
+    _run("job poll", run)
+
+
+@job_app.command("cancel")
+def job_cancel(
+    job_id: str = typer.Argument(..., help="作业 id"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+) -> None:
+    """取消作业：杀掉进程树，并给出**已完成 / 未完成**清单。"""
+
+    def run() -> Envelope:
+        store = _job_store(library_root)
+        data = jobs.cancel(store, job_id)
+        return Envelope(
+            ok=True,
+            data=data,
+            warnings=[f"已取消；完成 {data['completed_count']} 项，未完成 {data['unfinished_count']} 项"],
+        )
+
+    _run("job cancel", run)
+
+
+@job_app.command("result")
+def job_result(
+    job_id: str = typer.Argument(..., help="作业 id"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+) -> None:
+    """作业最终摘要：子进程的信封 + 逐项结果。
+
+    作业失败 → 退出码 2；作业被取消 → 退出码 5。
+    """
+
+    def run() -> Envelope:
+        store = _job_store(library_root)
+        data = jobs.result(store, job_id)
+        state = data.get("state")
+        exit_code = EXIT_OK
+        if state == jobs.STATE_FAILED:
+            exit_code = EXIT_ERROR
+        elif state == jobs.STATE_CANCELLED:
+            exit_code = EXIT_CANCELLED
+        return Envelope(
+            ok=state == jobs.STATE_SUCCEEDED,
+            data=data,
+            warnings=list(data.get("warnings") or []),
+            exit=exit_code,
+        )
+
+    _run("job result", run)
+
+
+@job_app.command("list")
+def job_list(
+    limit: int = typer.Option(20, "--limit", help="最多列几条"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+) -> None:
+    """列出最近的作业。"""
+
+    def run() -> Envelope:
+        store = _job_store(library_root)
+        states = store.list(limit=limit)
+        return Envelope(
+            ok=True,
+            data={
+                "jobs_dir": str(store.root),
+                "count": len(states),
+                "jobs": [
+                    {
+                        "job_id": s.id,
+                        "command": s.command,
+                        "state": s.state,
+                        "exit_code": s.exit_code,
+                        "items_done": len(s.done),
+                        "items_failed": len(s.failed),
+                        "created_at": s.created_at,
+                        "finished_at": s.finished_at,
+                    }
+                    for s in states
+                ],
+            },
+        )
+
+    _run("job list", run)
 
 
 # ── 辅助 ──────────────────────────────────────────────────────────────────

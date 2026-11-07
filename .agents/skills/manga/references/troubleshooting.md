@@ -35,7 +35,7 @@ manga doctor      # PowerShell？脚本在不在？jmcomic 装没装？代理端
 | 报 `Naming` | 文件名没话号前缀 | `manga ingest` 会自动改名；或按 §命名规范手改 |
 | 报 `Metadata`（缺 ComicInfo） | 没生成元数据 | `manga ingest --apply --generate-comicinfo` |
 | 报 `Layout`（图片在包内子目录） | 打包时没平铺 | 重打包时图片放**包根目录** |
-| 转换脚本报「没有找到图片目录」 | 源目录结构不符 | 看 `dir_rule.rule`；应为 `Bd_Atitle/Pname`（两层：`<base>\<本子>\<章节>\*.jpg`） |
+| 转换脚本报「没有找到图片目录」 | 源目录结构不符 | 看 `dir_rule.rule`；应为 `Bd/Atitle/Pname`（三层：`<base>\<本子>\<章节>\*.jpg`）。⚠ **不是** `Bd_Atitle/Pname` —— 那样会生成字面量目录 `Bd_Atitle`，所有章节会被归到同一个系列下 |
 | 入库后文件没动 | 忘了 `--apply` | 默认 dry-run。先干跑看计划，确认后加 `--apply` |
 | 入库报冲突 | 同名目标已存在 | **正常**：策略是「跳过不覆盖」，源文件留在收件箱。确认是同一本再决定是否改名 |
 | 校验器很慢 | 库在 SMB / 网络盘 | 库放本地 SSD；网络盘只当备份 |
@@ -58,7 +58,7 @@ manga doctor      # PowerShell？脚本在不在？jmcomic 装没装？代理端
 |---|---|
 | `找不到脚本：X.ps1` | `--scripts-dir` 或环境变量 `MANGA_SCRIPTS_DIR` 指向仓库 `scripts/`；`Convert-JmComicToCbz.ps1` 在 `jmcomic/` 下，CLI 会自动找 |
 | 控制台中文乱码 | 脚本必须是 UTF-8 **with BOM**；PowerShell 7（pwsh）默认正常 |
-| 沙箱内 `%TEMP%` 不可写 | pytest 已配 `--basetemp` 落在工作区；普通命令不受影响 |
+| 沙箱内 pytest 临时目录不可写 | 本项目**不用** pytest 的 `tmp_path`/`--basetemp`：Windows 上 `\\?\` 扩展路径前缀沙箱不认，`tempfile.mkdtemp` 又会给目录套受限权限 → 改用 `tests/conftest.py` 的 `workdir` fixture（工作区内普通 `mkdir`）。普通命令不受影响 |
 | `uv` 报缓存权限错 | 设 `UV_CACHE_DIR=<仓库>\.uv-cache` |
 | Python 建的临时目录里不能再建子目录 | Windows 下 `tempfile.mkdtemp` 会套受限权限；用普通 `mkdir` |
 
@@ -68,7 +68,9 @@ manga doctor      # PowerShell？脚本在不在？jmcomic 装没装？代理端
 
 | 现象 | 处理 |
 |---|---|
-| `DEP_MISSING`：导出缺少 `img2pdf` | `uv pip install img2pdf`（`--format longimg` 缺的是 `pillow`；加密 zip 缺 `pyzipper`/`py7zr`；加密 pdf 缺 `pikepdf`）。**CLI 不会自动装**，它只给命令 |
+| `DEP_MISSING`：导出缺少 `img2pdf` | 退出码 **4**（缺东西，不是执行错）。`uv pip install img2pdf`（`--format longimg` 缺的是 `pillow`；加密 zip 缺 `pyzipper`/`py7zr`；加密 pdf 缺 `pikepdf`）。**CLI 不会自动装**，它只给命令 |
+| `TOOL_MISSING`：找不到 `gallery-dl` / `mangadex-dl` | 退出码 **4**（同上：缺东西）。hint 里给安装命令（`uv tool install gallery-dl` / `scoop install gallery-dl`）。**CLI 不会自动装** |
+| `ENV_PYINSTALLER`：gallery-dl 报 `Failed to create parent directory structure` | 不是 URL 问题，是 **PyInstaller 版 gallery-dl 要往临时目录解压运行时**，而受限环境的临时目录不可写。本适配层已把 `TEMP`/`TMP` 指到可写目录；仍失败就换非 PyInstaller 版（`uv tool install gallery-dl`） |
 | `auth.logged_in = false` 但有 `has_username`/`has_password` | 那只是**凭据**不是登录态 —— 下载时 jmcomic 才会去登录。失败点会出现在下载阶段（退出码 3），不在配置阶段 |
 | `auth.logged_in = false` 且有 cookies | cookies 在，但缺**用户标识**：`api` 客户端要 `auth.user_id`，`html` 客户端要 `auth.username` |
 | `doctor` 报 `jmcomic` 版本低于下限 | option 新字段会被**静默忽略**（表现为「配了不生效」）→ 升级 jmcomic |
@@ -108,9 +110,14 @@ manga verify --series 18comic              # 来源层会自动摊平成叶子�
 4. **文档默认值 ≠ 代码默认值**：`threading.image` 文档 30 / 代码 **20**；`dir_rule.rule` 文档 `Bd / Ptitle` / 代码 **`Bd_Pname`**；`client.impl` 文档示例 `html` / 实际默认 **`api`**。以本机 2.7.11 源码为准。
 5. **`--dry-run` 会忽略 `--option`** —— 干跑看不出你的落点配置。
 6. **`dir_rule.base_dir` 默认 = 当前工作目录** —— 不改的话图会落在你当时所在的目录。
-7. **并发是乘数**：本子数 × `threading.photo` × `threading.image`，默认可达 320 线程 → 用 `JmSyncRuntime` 封顶。
+7. **并发是乘数**：2.7.11 的经典路径是**每层一个独立临时池**（`JmTempRuntime(workers=count_batch)`）——
+   章节层 = `threading.photo`(默认 24)，图片层 = `threading.image`(默认 20)，批量层再加「每个 ID 一个线程」。
+   所以单个本子最坏情况是 **24 × 20 = 480 个并发图片下载**，批量再乘本子数 → 用 `JmSyncRuntime` 封顶。
 8. **异步端不支持 `domain_retry_strategy`** —— 传了直接 `TypeError`。
-9. **自定义异步插件**要 `enter_wait_list` + `wait_until_finish`，主程序退出前会调 `option.wait_all_plugins_finish()`。
+9. **★ `wait_all_plugins_finish()` 上游只定义、**不自动调用**【源码】：`JmOption.wait_all_plugins_finish()`
+   存在（`jm_option.py:1050`），但 2.7.11 里**没有任何调用点** —— 自定义异步插件要自己
+   `enter_wait_list` + `wait_until_finish`，并由**调用方**在退出前显式调 `option.wait_all_plugins_finish()`
+   （本项目的 CLI 还没接这一步，见 P4 待办）。
 10. **★ `dir_rule.rule` 的分隔符与写法不能混用**：`Bd_Atitle/Pname` 会渲染成 `<base>/Bd_Atitle/<章节名>/`
     （字面量目录 `Bd_Atitle`）→ 转换脚本会把所有章节归到名为 `Bd_Atitle` 的系列下。
     正确写法：`Bd/Atitle/Pname`、`Bd_Atitle_Pname`、`Bd / {Atitle} / {Pname}`。详见 [naming.md](naming.md)。

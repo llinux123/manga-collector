@@ -38,7 +38,7 @@ Export\Manga\<系列名>\        # 干净导出 → Syncthing 共享给手机（
 ## 3. 入库标准动作（固定三步）
 
 ```powershell
-# ① 打���（图片 → CBZ），先干跑
+# ① 打包（图片 → CBZ），先干跑
 manga convert-cbz                      # 默认 dry-run
 manga convert-cbz --apply
 
@@ -60,7 +60,11 @@ manga verify                           # 退出码 0 才算入库成功
 ```
 
 - 校验器内置正则：`^(?:(?:vol|volume|卷)\s*\.?\s*)?(?:第\s*)?(?<number>\d+(?:\.\d+)*(?:[-–—]\d+)?)\s*(?:(?:[-–—]|:|：)\s*|\s+)?(?<title>.+)?$`
-- `01 - 标题`、`001 - 标题`、`Vol.3 - 标题`、`第01话 标题`、`Chapter 01` 都算合规；没有话号前缀（如 `chapter_two.cbz`）算违规。
+- 合规实例（**用上面这条正则实测过**）：`001 - 幸福督市.cbz`、`01 - 标题.cbz`、`Vol.3 - 标题.cbz`、`第01话 标题.cbz`、`第100話 97.cbz`、`012 - 标题.cbz`、`12.5 - 标题.cbz`。
+- **违规实例**：`Chapter 01.cbz`（编号必须以数字开头，`Chapter` 这种英文前缀不认）、`chapter_two.cbz`（没有数字编号）。
+  ⚠ 文档旧版把 `Chapter 01` 写成「合规」，是**错的** —— 正则里 `number` 组必须是 `\d+` 开头。
+- 编号从文件名里**提取**用的是另一条正则：`^(?<num>\d{1,4}(?:\.\d{1,3})?)\s+-\s+(?<title>.+)$`
+  （只认「数字 - 标题」形态；`Vol.`/`第X话` 这类不参与编号比对，免得误报）。
 - 图片**平铺在包根目录**（不要子目录）——Mihon 本地源会忽略包内子目录。
 - 完整规范在 manga 工作区的 `spec/naming-and-metadata.md`（见 [workspace-dependency.md](../../../docs/workspace-dependency.md)）。
 
@@ -82,7 +86,8 @@ manga verify                           # 退出码 0 才算入库成功
 ```
 
 - `Number` **必填**，缺失报 `Metadata` 错误。
-- `LanguageISO` 由目录前缀推断（`zh/ja/ko/en` → `zh-CN/ja/ko/en`）。
+- `LanguageISO` 由**路径里任意一段**的语言前缀推断（`zh`/`zh-cn`/`cn` → `zh-CN`，`ja`/`jp` → `ja`，`ko` → `ko`，`en` → `en`）；
+  没命中就留空（所以像「幸福督市」这种纯中文标题的系列，入库后 `LanguageISO` 是空的 —— 需要的话手写 ComicInfo 补）。
 - 写不了 ComicInfo 时可用 ComicTagger（GUI，1.5.5）补。
 
 ## 6. 校验器查什么（问题类别 → 后果）
