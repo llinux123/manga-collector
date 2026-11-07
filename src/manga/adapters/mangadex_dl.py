@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from ..envelope import EXIT_ERROR, EXIT_NOTFOUND, MangaError
 from .gallery_dl import (
@@ -128,6 +128,7 @@ def download(
     export_dir: Path | None = None,
     library_dir: Path | None = None,
     timeout: float | None = 3600.0,
+    extra_args: Sequence[str] = (),
 ) -> dict[str, Any]:
     """用 mangadex-dl 下载（``--save-as cbz``），并检查 ComicInfo.xml。
 
@@ -173,7 +174,7 @@ def download(
 
     before = _cbz_snapshot(dest)
 
-    argv = [str(exe), "--save-as", "cbz", "--path", str(dest)]
+    argv = [str(exe), "--save-as", "cbz", "--path", str(dest), *[str(a) for a in extra_args]]
     if language:
         argv += ["--language", str(language)]
     argv.append(url)

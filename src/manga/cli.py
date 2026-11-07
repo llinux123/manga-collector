@@ -94,15 +94,31 @@ def _run(command: str, fn) -> None:
 
 
 def _start_cancel_watchdog() -> None:
-    """在作业里跑时，盯着「取消标记」，看到就自己退出。
+    """在作业里跑时，盯着「取消标记」，看到就先优雅取消、再强退。
 
-    协作式取消 —— 不用外部去杀进程（受限环境里外部杀法常被拒）。
+    **两级取消**：先调所有已注册的 ``DownloadControl.cancel()``（给 jmcomic
+    一个在下一个检查点优雅停下的机会），等几秒后还没退出就 ``os._exit``。
     """
     job_dir = os.environ.get(jobs.ENV_JOB_DIR)
     if not job_dir:
         return
+
+    def _graceful_cancel() -> None:
+        # ① jmcomic 的协作式取消（DownloadControl → 下一个检查点优雅停下）
+        for control in _active_controls:
+            try:
+                control.cancel("用户取消")
+            except Exception:  # noqa: BLE001 - 取消回调炸了也得能退
+                pass
+        # ② 外部下载器（gallery-dl / mangadex-dl）—— 直接杀掉孙进程
+        #    （这些进程是本进程起的，Popen.kill 不需要特权）
+        try:
+            gallery_dl.kill_active()
+        except Exception:  # noqa: BLE001
+            pass
+
     try:
-        jobs.start_cancel_watchdog(Path(job_dir))
+        jobs.start_cancel_watchdog(Path(job_dir), on_cancel=_graceful_cancel, grace=5.0)
     except Exception:  # noqa: BLE001 - 看门狗起不来不该影响命令本身
         pass
 
@@ -651,17 +667,21 @@ def guard(
 # ── jmcomic 采集命令（P1） ────────────────────────────────────────────────
 
 
-def _jm_option(p: Paths, *, dest: Path | None = None):
+def _jm_option(p: Paths, *, dest: Path | None = None, option_file: str | None = None):
     """按 option 文件构造 JmOption。
 
     落点由 CLI 决定（option 文件只提供 client/download 行为），
     红线目录（共享区 / 权威库）在构造阶段就被拒。
 
+    ``option_file``：变体配置文件（``--option``）。不给则用 ``p.option_file``
+    （工作区默认或 ``MANGA_OPTION_FILE`` 环境变量）。
+
     同时把 option 记到 ``_current_options`` —— 命令退出前要调
     ``wait_all_plugins_finish()`` 等异步插件收工（上游只定义、不自动调）。
     """
+    chosen = Path(option_file).expanduser() if option_file else p.option_file
     option = jm_adapter.build_option(
-        p.option_file,
+        chosen,
         dest=dest,
         export_dir=p.export,
         library_dir=p.library,
@@ -672,6 +692,9 @@ def _jm_option(p: Paths, *, dest: Path | None = None):
 
 #: 本次命令用到的 JmOption（退出前统一等插件收工）
 _current_options: list[Any] = []
+
+#: 本次命令创建的 DownloadControl（取消看门狗看到标记后逐个调 cancel()）
+_active_controls: list[Any] = []
 
 
 def _finish_plugins() -> None:
@@ -705,20 +728,54 @@ def _run_in_log_dir(p: Paths, fn):
 
 @app.command()
 def search(
-    query: str = typer.Argument(..., help="关键词（+包含 -排除，空格=AND）"),
+    query: str | None = typer.Argument(None, help="关键词（+包含 -排除，空格=AND）；用 --ranking / --category 时可省略"),
     mode: str = typer.Option("site", "--mode", help="site|tag|author|work|actor"),
     page: int = typer.Option(1, "--page", help="页码"),
     limit: int = typer.Option(20, "--limit", help="最多返回条数"),
+    category: str | None = typer.Option(None, "--category", help="分类：all|doujin|single|short|another|hanman|meiman|doujin_cosplay|3d|english_site"),
+    time: str | None = typer.Option(None, "--time", help="时间范围：all|today|week|month"),
+    order_by: str | None = typer.Option(None, "--order-by", help="排序：latest|view|picture|like|score|comment"),
+    ranking: str | None = typer.Option(None, "--ranking", help="排行榜：day|week|month"),
     impl: str | None = typer.Option(None, "--impl", help="api|html（默认取 option）"),
+    option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
-    """禁漫搜索（五个维度）。"""
+    """禁漫搜索（关键词五维）+ 分类浏览 + 排行榜。
+
+    * 关键词搜索：``manga search <关键词> [--mode tag|author|work|actor]``
+    * 分类浏览：``manga search --category hanman --time week --order-by latest``
+    * 排行榜：``manga search --ranking week``
+    """
 
     def run() -> Envelope:
+        if ranking is not None and query is not None:
+            raise MangaError(
+                "--ranking 与关键词互斥",
+                code="BAD_USAGE",
+                exit_code=EXIT_USAGE,
+                hint="排行榜不需要关键词；分类浏览才用 --category",
+            )
+        if ranking is None and category is None and not query:
+            raise MangaError(
+                "搜索需要关键词，或指定 --category / --ranking",
+                code="BAD_USAGE",
+                exit_code=EXIT_USAGE,
+            )
         p = _paths(library_root, scripts_dir)
-        option = _jm_option(p)
-        data = jm_adapter.search(option, query, mode=mode, page=page, limit=limit, impl=impl)
+        option = _jm_option(p, option_file=option_file)
+        data = jm_adapter.search(
+            option,
+            query or "",
+            mode=mode,
+            page=page,
+            limit=limit,
+            impl=impl,
+            category=category,
+            time=time,
+            order_by=order_by,
+            ranking=ranking,
+        )
         return Envelope(ok=True, data=data)
 
     _run("search", run)
@@ -727,7 +784,7 @@ def search(
 @app.command()
 def album(
     album_id: str = typer.Argument(..., help="本子 ID（禁漫车号）"),
-    impl: str | None = typer.Option(None, "--impl"),
+    option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
@@ -735,7 +792,7 @@ def album(
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
-        option = _jm_option(p)
+        option = _jm_option(p, option_file=option_file)
         data = jm_adapter.album_detail(option, album_id, impl=impl)
         return Envelope(ok=True, data=data)
 
@@ -747,7 +804,7 @@ def comments(
     album_id: str = typer.Argument(..., help="本子 ID"),
     page: int = typer.Option(1, "--page"),
     limit: int = typer.Option(50, "--limit"),
-    impl: str | None = typer.Option(None, "--impl"),
+    option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
@@ -755,7 +812,7 @@ def comments(
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
-        option = _jm_option(p)
+        option = _jm_option(p, option_file=option_file)
         data = jm_adapter.comments(option, album_id, page=page, limit=limit, impl=impl)
         return Envelope(ok=True, data=data)
 
@@ -770,6 +827,7 @@ def download(
     apply: bool = typer.Option(False, "--apply", help="真正下载；不加就是 dry-run（只解析章节数）"),
     login: bool = typer.Option(True, "--login/--no-login", help="是否用 option 里的账号自动登录"),
     impl: str | None = typer.Option(None, "--impl"),
+    option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置（默认用工作区的 option.yml）"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
@@ -777,13 +835,27 @@ def download(
 
     **默认 dry-run**（只报章节数与图片数）；加 ``--apply`` 才真正下载。
     落点不得是共享区（``Export\\Manga``）或权威库（``Manga\\Library``）——违反即退出码 6。
+
+    **透传**：jmcomic 的高级能力（插件、并发、域名…）不写进 CLI 参数 ——
+    用 ``--option <变体.yml>`` 换一份配置即可（见 references/option-and-plugins.md）。
     """
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
         # 落点先解析成绝对路径：切工作目录后相对路径会跟着跑偏
         target = Path(dest).expanduser().resolve() if dest else p.raw_jmcomic
-        option = _jm_option(p, dest=target)
+        option = _jm_option(p, dest=target, option_file=option_file)
+
+        # 协作式取消：作业模式下创建 DownloadControl，注册给取消看门狗
+        control = None
+        if os.environ.get(jobs.ENV_JOB_DIR) and apply:
+            try:
+                from jmcomic import DownloadControl
+
+                control = DownloadControl()
+                _active_controls.append(control)
+            except ImportError:  # pragma: no cover - jmcomic 未装时静默跳过
+                pass
 
         def _do():
             return jm_adapter.download(
@@ -797,6 +869,7 @@ def download(
                 login=login,
                 impl=impl,
                 on_progress=_job_progress,
+                control=control,
             )
 
         # 作业模式（manga job start download …）：先把条目登记进去，
@@ -825,6 +898,7 @@ def export_cmd(
     filename_rule: str = typer.Option("Atitle", "--filename-rule", help="A 前缀=本子字段，P 前缀=章节字段"),
     login: bool = typer.Option(True, "--login/--no-login"),
     impl: str | None = typer.Option(None, "--impl"),
+    option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
@@ -837,7 +911,7 @@ def export_cmd(
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
         target = Path(dest).expanduser().resolve() if dest else p.raw_jmcomic
-        option = _jm_option(p, dest=target)
+        option = _jm_option(p, dest=target, option_file=option_file)
 
         def _do():
             return jm_adapter.export(
@@ -878,6 +952,7 @@ def domains(
 def pick_domain(
     timeout: float = typer.Option(5.0, "--timeout", help="单域名超时秒数"),
     limit: int = typer.Option(5, "--limit", help="返回几个最快的可用域名"),
+    option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
@@ -890,7 +965,7 @@ def pick_domain(
         p = _paths(library_root, scripts_dir)
         option = None
         try:
-            option = _jm_option(p)
+            option = _jm_option(p, option_file=option_file)
         except Exception:  # noqa: BLE001 - option 缺失也不该挡住域名探测
             pass
         data = jm_adapter.pick_domain(option, timeout=timeout, limit=limit)
@@ -919,6 +994,7 @@ def version() -> None:
 def favorites(
     dest: str | None = typer.Option(None, "--dest", help="落点（默认 <library-root>\\Manga\\Metadata\\favorites）"),
     make_zip: bool = typer.Option(False, "--zip", help="额外打一个 zip"),
+    option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
@@ -936,7 +1012,7 @@ def favorites(
             if dest
             else (p.metadata / "favorites").resolve()
         )
-        option = _jm_option(p)
+        option = _jm_option(p, option_file=option_file)
         data, warnings = _run_in_log_dir(
             p,
             lambda: favorites_mod.export_favorites(
@@ -955,6 +1031,7 @@ def favorites(
 
 @app.command()
 def checkin(
+    option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
@@ -962,7 +1039,7 @@ def checkin(
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
-        option = _jm_option(p)
+        option = _jm_option(p, option_file=option_file)
         data, warnings = _run_in_log_dir(p, lambda: favorites_mod.checkin(option))
         if data.get("already_checked_in"):
             warnings.append("今天已经签过过了")
@@ -974,12 +1051,15 @@ def checkin(
 # ── 外部下载器（P3） ──────────────────────────────────────────────────────
 
 
-@app.command("gallery-dl")
+@app.command("gallery-dl", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def gallery_dl_cmd(
+    ctx: typer.Context,
     urls: list[str] = typer.Argument(..., help="要下载的 URL（可多个）"),
     dest: str | None = typer.Option(None, "--dest", help="落点（默认 <library-root>\\00-Incoming\\Manga）"),
     apply: bool = typer.Option(False, "--apply", help="真正下载；不加就是**预检**（只模拟，不落盘）"),
     timeout: float = typer.Option(120.0, "--timeout", help="单次命令超时（秒）"),
+    config: str | None = typer.Option(None, "--config", help="gallery-dl 配置文件（透传给 gallery-dl 的 -c）"),
+    option: list[str] = typer.Option(None, "-o", help="gallery-dl 选项覆盖（透传给 gallery-dl 的 -o key=value）"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
@@ -988,11 +1068,23 @@ def gallery_dl_cmd(
     **默认预检**：`gallery-dl -s` 只模拟、不落盘 → 判断这个 URL 站不支持。
     不支持的 URL 明确返回「不支持」（退出码 4），**不会**发起下载。
     加 ``--apply`` 才真下载。落点同样受红线约束。
+
+    **透传**：``--config`` / ``-o`` / ``--`` 之后的参数原样转发给 gallery-dl
+    （预检时不透传 —— 预检只回答「支不支持」）。
     """
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
         target = Path(dest).expanduser().resolve() if dest else p.inbox.resolve()
+
+        # 组装透传参数：--config → -c；-o 原样；-- 之后的原样
+        passthrough: list[str] = []
+        if config:
+            passthrough.extend(["-c", config])
+        if option:
+            for kv in option:
+                passthrough.extend(["-o", kv])
+        passthrough.extend(ctx.args)
 
         if not apply:
             checks = [gallery_dl.precheck(url, timeout=timeout) for url in urls]
@@ -1004,6 +1096,8 @@ def gallery_dl_cmd(
                 "supported_count": len(checks) - len(unsupported),
                 "unsupported_count": len(unsupported),
             }
+            if passthrough:
+                data["note"] = "预检不应用透传参数（预检只回答「支不支持」）；下载时才会带上"
             if unsupported:
                 raise MangaError(
                     "gallery-dl 不支持这些 URL：" + "、".join(str(c.get("url")) for c in unsupported),
@@ -1014,20 +1108,27 @@ def gallery_dl_cmd(
                 )
             return Envelope(ok=True, data=data, warnings=["dry-run：未加 --apply，未下载任何文件"])
 
+        # 红线：透传参数里的落点不得指向共享区/权威库
+        from .passthrough import assert_passthrough_safe
+
+        assert_passthrough_safe(passthrough, export_dir=p.export, library_dir=p.library)
+
         data = gallery_dl.download(
             urls,
             target,
             export_dir=p.export,
             library_dir=p.library,
             timeout=timeout if timeout >= 3600 else 3600.0,
+            extra_args=passthrough,
         )
         return Envelope(ok=True, data=data)
 
     _run("gallery-dl", run)
 
 
-@app.command("mangadex-dl")
+@app.command("mangadex-dl", context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def mangadex_dl_cmd(
+    ctx: typer.Context,
     url: str = typer.Argument(..., help="MangaDex 的作品 URL"),
     dest: str | None = typer.Option(None, "--dest", help="落点（默认 <library-root>\\00-Incoming\\Manga）"),
     language: str | None = typer.Option(None, "--language", help="语言过滤（如 zh；留空 = 不限）"),
@@ -1040,11 +1141,14 @@ def mangadex_dl_cmd(
 
     **默认预检**：只确认工具在不在、计划怎么跑，不下载。
     加 ``--apply`` 才真下载（产物是 CBZ，带 ComicInfo.xml）。
+
+    **透传**：``--`` 之后的参数原样转发给 mangadex-dl。
     """
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
         target = Path(dest).expanduser().resolve() if dest else p.inbox.resolve()
+        passthrough = list(ctx.args)
 
         if not apply:
             exe = mangadex_dl.find_executable()  # 找不到会抛 TOOL_MISSING（退出码 4）
@@ -1057,11 +1161,16 @@ def mangadex_dl_cmd(
                     "language": language,
                     "executable": str(exe),
                     "command": f"mangadex-dl --save-as cbz --path {target}"
+                    + "".join(f" {a}" for a in passthrough)
                     + (f" --language {language}" if language else "")
                     + f" {url}",
                 },
                 warnings=["dry-run：未加 --apply，未下载任何文件"],
             )
+
+        from .passthrough import assert_passthrough_safe
+
+        assert_passthrough_safe(passthrough, export_dir=p.export, library_dir=p.library)
 
         data = mangadex_dl.download(
             url,
@@ -1070,6 +1179,7 @@ def mangadex_dl_cmd(
             export_dir=p.export,
             library_dir=p.library,
             timeout=timeout,
+            extra_args=passthrough,
         )
         return Envelope(ok=True, data=data)
 

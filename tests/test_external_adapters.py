@@ -48,22 +48,15 @@ class _Call:
     temp_dir_exists: bool | None = None
 
 
-@dataclass
-class _Recorder:
-    """记录所有 ``subprocess.run`` 调用，并按需替身执行。"""
+class _FakePopen:
+    """冒充 ``subprocess.Popen``：记录调用参数，``communicate`` 返回预置的 stdout/stderr。"""
 
-    calls: list[_Call] = field(default_factory=list)
-    stdout: str = ""
-    stderr: str = ""
-    returncode: int = 0
-    on_call: object | None = None
-
-    def run(self, argv, **kwargs):  # noqa: ANN001 - 冒充 subprocess.run
+    def __init__(self, recorder: _Recorder, argv, **kwargs) -> None:
         env = kwargs.get("env")
         temp_dir_exists: bool | None = None
         if env and "TEMP" in env:
             temp_dir_exists = Path(env["TEMP"]).is_dir()
-        self.calls.append(
+        recorder.calls.append(
             _Call(
                 argv=[str(a) for a in argv],
                 cwd=kwargs.get("cwd"),
@@ -72,14 +65,37 @@ class _Recorder:
                 temp_dir_exists=temp_dir_exists,
             )
         )
-        if self.on_call is not None:
-            self.on_call([str(a) for a in argv], kwargs)
-        return subprocess.CompletedProcess(
-            args=[str(a) for a in argv],
-            returncode=self.returncode,
-            stdout=self.stdout,
-            stderr=self.stderr,
-        )
+        if recorder.on_call is not None:
+            recorder.on_call([str(a) for a in argv], kwargs)
+        self._recorder = recorder
+        self.returncode = recorder.returncode
+        self._killed = False
+
+    def communicate(self, timeout=None):  # noqa: ANN001
+        return self._recorder.stdout, self._recorder.stderr
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self) -> None:
+        self._killed = True
+
+    def wait(self, timeout=None):  # noqa: ANN001
+        return self.returncode
+
+
+@dataclass
+class _Recorder:
+    """记录所有 ``_POPEN`` 调用，并按需替身执行。"""
+
+    calls: list[_Call] = field(default_factory=list)
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 0
+    on_call: object | None = None
+
+    def popen(self, argv, **kwargs):  # noqa: ANN001 - 冒充 subprocess.Popen
+        return _FakePopen(self, argv, **kwargs)
 
     @property
     def download_calls(self) -> list[_Call]:
@@ -101,7 +117,7 @@ def _install(
     """
     mapping = tools if tools is not None else {}
     monkeypatch.setattr(gallery_dl.shutil, "which", lambda cmd, *a, **k: mapping.get(cmd))
-    monkeypatch.setattr(gallery_dl.subprocess, "run", recorder.run)
+    monkeypatch.setattr(gallery_dl, "_POPEN", recorder.popen)
     # 兜底路径在测试机上可能真的存在（scoop）→ 关掉，保证行为可预期
     monkeypatch.setattr(gallery_dl, "FALLBACK_PATHS", ())
 

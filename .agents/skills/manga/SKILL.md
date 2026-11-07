@@ -51,12 +51,12 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 |---|---|---|
 | `manga paths` | 打印所有解析后的路径（收件箱/权威库/共享区/脚本目录） | 否 |
 | `manga doctor` | 环境体检：PowerShell、脚本、jmcomic（**导入 + 版本下限**）、**登录态**、**可选依赖**、代理端口、目录、工作区 | 否 |
-| `manga search` | 禁漫搜索（site/tag/author/work/actor 五维） | 否 |
+| `manga search` | 禁漫搜索（site/tag/author/work/actor 五维）+ 分类浏览 + 排行榜 | 否 |
 | `manga album` | 本子详情（含章节列表） | 否 |
 | `manga comments` | 本子评论（含回评树） | 否 |
 | `manga domains` | 当前域名池（API 静态池 + 网页端域名） | 否 |
 | `manga pick-domain` | 并发探测域名池，列出最快的可用域名 | 否 |
-| `manga download` | 下载本子/章节到暂存区 | **默认 dry-run**，要 `--apply` |
+| `manga download` | 下载本子/章节到暂存区（`--option <file>` 换变体配置） | **默认 dry-run**，要 `--apply` |
 | `manga export` | 导出 ZIP / PDF / 长图（走 jmcomic Feature） | 是 |
 | `manga verify` | 只读校验权威库（命名/元数据/可读率/编号一致性/重复）；`--series <名>` 可只校验单个系列（增量验收） | 否 |
 | `manga ingest` | 入库整理：重命名 + 写 ComicInfo.xml + 移入权威库 | **默认 dry-run**，要 `--apply` |
@@ -83,6 +83,17 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 
 **落点红线**：`manga download` / `manga export` 的落点若落在
 `Export\Manga`（共享区）或 `Manga\Library`（权威库）→ **退出码 6**，这是代码强制的，改参数绕不过去。
+透传参数（`--option` / `--config` / `-o` / `--`）里的路径也会被扫 —— 指向红线目录一样拒。
+
+**透传约定**（各源的高级能力不逐个映射成 CLI 参数）：
+
+| 源 | 透传方式 |
+|---|---|
+| jmcomic | `--option <file>` 换一份变体配置（插件/threading/domain 全在里面） |
+| gallery-dl | `--config <file>` + `-o key=value`（可多次）+ `--` 之后的原样参数 |
+| mangadex-dl | `--` 之后的原样参数 |
+
+预检（不加 `--apply`）**不透传** —— 预检只回答「支不支持」。
 
 ## 3. 输出契约（必须遵守）
 
@@ -180,6 +191,10 @@ manga job cancel <job_id>                            # 真能停：给已完成 
 **作业取消是协作式的**：`job cancel` 只写一个取消标记，**子进程自己**看到后退出
 （受限环境里外部杀「别的进程创建出来的进程」常被拒 —— 沙箱、容器、CI 都这样）。
 所以取消后最多等几秒，作业就会变成 `cancelled`；`job result` 里能看到已完成/未完成清单。
+
+**两级取消**（jmcomic）：看门狗看到标记 → 先调 `DownloadControl.cancel()`（给 jmcomic
+一个在下一个检查点**优雅停下**的机会，保留已下载的进度）→ 等 5 秒还没退出 → `os._exit` 强退。
+外部下载器（gallery-dl / mangadex-dl）：直接杀孙进程（`Popen.kill`，不需要特权）。
 
 - jmcomic 的进度日志（`jmcomic-download.log`）是**相对路径**，落点=当前工作目录 →
   CLI 调 jmcomic 前会先切到 `<书库根>\Manga\Metadata\logs`，日志跟着走，**不会掉进仓库根**。

@@ -436,11 +436,22 @@ def cancel_requested(job_dir: Path) -> bool:
         return False
 
 
-def start_cancel_watchdog(job_dir: Path, *, interval: float = 0.4) -> None:
+def start_cancel_watchdog(
+    job_dir: Path,
+    *,
+    interval: float = 0.4,
+    on_cancel: Any = None,
+    grace: float = 5.0,
+) -> None:
     """子进程侧：盯着取消标记，看到就自己退出。
 
-    用 ``os._exit`` 是故意的 —— 它**立刻**结束整个进程（不等栈展开、不等
-    其它线程），这正是「取消」该有的样子。终态报告在退出前先写好。
+    **两级取消**：
+
+    1. ``on_cancel`` 给了就先调它（比如 jmcomic 的 ``DownloadControl.cancel()``），
+       给最多 ``grace`` 秒让工作**优雅**收尾（断点续传已下的部分、写进度）；
+    2. 超时还没退出 → ``os._exit(EXIT_CANCELLED)``（立刻，不等栈展开）。
+
+    没有 ``on_cancel`` 时行为和原来一样（看到标记直接退）。
     """
     import threading
 
@@ -448,6 +459,16 @@ def start_cancel_watchdog(job_dir: Path, *, interval: float = 0.4) -> None:
         while True:
             try:
                 if cancel_requested(job_dir):
+                    if on_cancel is not None:
+                        try:
+                            on_cancel()
+                        except Exception:  # noqa: BLE001 - 取消回调炸了也得能退
+                            pass
+                        # 给优雅收尾最多 grace 秒
+                        deadline = time.time() + grace
+                        while time.time() < deadline:
+                            # 如果主线程在收尾时自己结束了，这个守护线程会随进程退出
+                            time.sleep(0.3)
                     _write_final(
                         job_dir,
                         {"state": STATE_CANCELLED, "exit_code": EXIT_CANCELLED, "error": "已被取消"},

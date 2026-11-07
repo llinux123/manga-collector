@@ -237,6 +237,27 @@ def _child_env(temp_dir: Path) -> dict[str, str]:
     return env
 
 
+#: 本进程里**活着的**外部下载子进程（取消时由作业看门狗调用 :func:`kill_active`）。
+#:
+#: 为什么需要它：作业子进程在 ``os._exit`` 强退时，它启动的 gallery-dl/mangadex-dl
+#: **孙进程会被留下继续跑**。这两个适配器起的子进程都登记在这里，
+#: 看门狗的取消回调先把它们杀掉，再退自己。
+_ACTIVE_PROCESSES: list[subprocess.Popen] = []
+
+#: 测试接缝：``_run`` 用它而不是直接 ``subprocess.Popen``，方便替身。
+_POPEN = subprocess.Popen
+
+
+def kill_active() -> None:
+    """杀掉所有还在跑的外部下载子进程（``Popen.kill`` 不需要特权 —— 是我们自己起的）。"""
+    for proc in list(_ACTIVE_PROCESSES):
+        try:
+            if proc.poll() is None:
+                proc.kill()
+        except (OSError, AttributeError):
+            pass
+
+
 def _run(
     argv: Sequence[str],
     *,
@@ -250,15 +271,30 @@ def _run(
     「stdout 只有一个 JSON 信封」这条契约。
 
     ``env`` 用来把子进程的临时目录指到可写位置（见 :func:`_child_env`）。
+
+    进程会登记进 :data:`_ACTIVE_PROCESSES`，取消时由 :func:`kill_active` 清理。
     """
-    return subprocess.run(  # noqa: S603 - argv 为列表，不走 shell
+    proc = _POPEN(  # noqa: S603 - argv 为列表，不走 shell
         list(argv),
         cwd=str(cwd),
         env=env,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
     )
+    _ACTIVE_PROCESSES.append(proc)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(list(argv), proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        try:
+            _ACTIVE_PROCESSES.remove(proc)
+        except ValueError:  # pragma: no cover - 已被 kill_active 清掉
+            pass
 
 
 def _is_pyinstaller_error(text: str) -> bool:
@@ -495,6 +531,7 @@ def download(
     library_dir: Path | None = None,
     cwd: Path | None = None,
     timeout: float | None = 3600.0,
+    extra_args: Sequence[str] = (),
 ) -> dict[str, Any]:
     """用 gallery-dl 下载（``--cbz`` 直接产出 CBZ），并**确认产物**。
 
@@ -546,7 +583,7 @@ def download(
     workdir = _writable_dir(cwd if cwd is not None else dest)
     temp_dir: Path | None = None
 
-    argv = [str(exe), "--cbz", "-d", str(dest), *url_list]
+    argv = [str(exe), "--cbz", "-d", str(dest), *[str(a) for a in extra_args], *url_list]
 
     try:
         with _scratch_dir(_temp_base(workdir)) as scratch:

@@ -260,8 +260,19 @@ def search(
     limit: int = 20,
     impl: str | None = None,
     domain_list: Sequence[str] | None = None,
+    category: str | None = None,
+    time: str | None = None,
+    order_by: str | None = None,
+    ranking: str | None = None,
 ) -> dict[str, Any]:
-    """站内搜索（site/tag/author/work/actor 五个维度）。"""
+    """站内搜索（site/tag/author/work/actor）或分类/排行榜浏览。
+
+    * ``mode`` + ``query``：关键词搜索（五维）；
+    * ``category`` + ``time`` + ``order_by``：分类浏览（``categories_filter``）；
+    * ``ranking``：日/周/月排行榜（``day_ranking`` / ``week_ranking`` / ``month_ranking``）。
+
+    ``ranking`` 与 ``mode``/``category`` 互斥 —— 排行榜不需要关键词。
+    """
     if mode not in SEARCH_MODES:
         raise MangaError(
             f"未知搜索维度：{mode}",
@@ -271,8 +282,46 @@ def search(
         )
 
     client = make_client(option, impl=impl, domain_list=domain_list)
-    method = getattr(client, SEARCH_MODES[mode])
-    result = method(query, page)
+    jm = _jmcomic()
+
+    if ranking is not None:
+        if ranking not in ("day", "week", "month"):
+            raise MangaError(
+                f"未知排行榜：{ranking}",
+                code="BAD_RANKING",
+                exit_code=EXIT_ERROR,
+                hint="可选：day / week / month",
+            )
+        result = getattr(client, f"{ranking}_ranking")(page)
+    elif category is not None:
+        time_const = getattr(jm.JmMagicConstants, f"TIME_{time.upper()}", None) if time else jm.JmMagicConstants.TIME_ALL
+        cat_const = getattr(jm.JmMagicConstants, f"CATEGORY_{category.upper()}", None)
+        order_const = getattr(jm.JmMagicConstants, f"ORDER_BY_{order_by.upper()}", None) if order_by else jm.JmMagicConstants.ORDER_BY_LATEST
+        if cat_const is None:
+            raise MangaError(
+                f"未知分类：{category}",
+                code="BAD_CATEGORY",
+                exit_code=EXIT_ERROR,
+                hint="可选：" + "、".join(n[9:].lower() for n in dir(jm.JmMagicConstants) if n.startswith("CATEGORY_")),
+            )
+        if time_const is None:
+            raise MangaError(
+                f"未知时间范围：{time}",
+                code="BAD_TIME",
+                exit_code=EXIT_ERROR,
+                hint="可选：all / today / week / month",
+            )
+        if order_const is None:
+            raise MangaError(
+                f"未知排序：{order_by}",
+                code="BAD_ORDER",
+                exit_code=EXIT_ERROR,
+                hint="可选：latest / view / picture / like / score / comment",
+            )
+        result = client.categories_filter(page=page, time=time_const, category=cat_const, order_by=order_const)
+    else:
+        method = getattr(client, SEARCH_MODES[mode])
+        result = method(query, page)
 
     items: list[dict[str, Any]] = []
     for album_id, title in result.iter_id_title():
@@ -288,6 +337,10 @@ def search(
         "page_count": _safe(lambda: result.page_count),
         "count": len(items),
         "items": items,
+        "category": category,
+        "time": time,
+        "order_by": order_by,
+        "ranking": ranking,
     }
 
 
@@ -406,6 +459,7 @@ def download(
     impl: str | None = None,
     domain_list: Sequence[str] | None = None,
     on_progress: Callable[[str, str, str | None], None] | None = None,
+    control: Any = None,
 ) -> dict[str, Any]:
     """下载本子（或章节）。
 
@@ -414,6 +468,8 @@ def download(
     * ``on_progress``：给了就**逐个 ID 驱动**并回调 ``(事件, id, 错误信息)``，
       事件 ∈ ``done`` / ``failed``。作业模型需要「哪个 ID 下完了」才能在取消时
       给出「已完成 / 未完成」清单 —— 上游的批量入口不暴露这个信息。
+    * ``control``：``DownloadControl`` 实例，用于协作式取消
+      （作业模型的看门狗看到取消标记后调 ``control.cancel(reason)``）。
     """
     dest = ensure_safe_dest(dest, export_dir=export_dir, library_dir=library_dir)
     ids = [str(i) for i in ids]
@@ -479,7 +535,7 @@ def download(
 
     if on_progress is None:
         try:
-            result = downloader(ids, option, check_exception=False, login=login)
+            result = downloader(ids, option, check_exception=False, login=login, control=control)
         except Exception as exc:
             raise _map_exception(exc, what="下载") from exc
         return _collect_download(result, dest=dest, kind=kind)
@@ -495,7 +551,7 @@ def download(
 
     def _one(target_id: str):
         try:
-            return target_id, downloader([target_id], option, check_exception=False, login=False), None
+            return target_id, downloader([target_id], option, check_exception=False, login=False, control=control), None
         except Exception as exc:  # noqa: BLE001 - 逐项隔离：一个失败不影响别的
             return target_id, None, exc
 
@@ -780,6 +836,16 @@ def _map_exception(exc: Exception, *, what: str) -> MangaError:
             code="DOMAIN_EXHAUSTED",
             exit_code=EXIT_ERROR,
             hint="先跑 manga domains / manga pick-domain，再重试",
+        )
+
+    if name == "DownloadCancelledException":
+        completed = [str(getattr(r, "detail", r)) for r in getattr(exc, "completed_results", []) or []]
+        unfinished = [str(i) for i in getattr(exc, "unfinished_ids", []) or []]
+        return MangaError(
+            f"{what}被取消：{getattr(exc, 'reason', '用户取消')}",
+            code="CANCELLED",
+            exit_code=5,
+            data={"completed": completed, "unfinished": unfinished},
         )
 
     if "login" in low or "登录" in message or "cookie" in low or "auth" in low:
