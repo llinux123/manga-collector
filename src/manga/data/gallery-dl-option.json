@@ -1,0 +1,229 @@
+{
+  "extractor": {
+    "allporncomic": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "dandadan": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "dankefuerslesen": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "dynastyscans": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "hentai2read": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "hentaihere": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "hiperdex": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "kagane": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "kaliscan": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "komikcast": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangadex": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangafire": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangafox": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangafreak": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangahere": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangapark": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangaread": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangareader": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangataro": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangatown": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "mangayi": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "rawkuma": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "senmanga": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "tcbscans": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    },
+    "weebcentral": {
+      "chapter": {
+        "directory": [
+          "{manga}",
+          "{chapter:>03} - {title|manga}"
+        ],
+        "filename": "{manga}_c{chapter:>03}{chapter_minor:?//}_{page:>03}.{extension}"
+      }
+    }
+  }
+}

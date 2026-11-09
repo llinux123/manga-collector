@@ -32,7 +32,13 @@ from .adapters import gallery_dl
 from .adapters import jmcomic as jm_adapter
 from .adapters import mangadex_dl
 from .adapters import pipeline
-from .config import ENV_LIBRARY_ROOT, ENV_WORKSPACE, Paths, resolve_paths
+from .config import (
+    ENV_LIBRARY_ROOT,
+    ENV_WORKSPACE,
+    Paths,
+    default_gallery_dl_config,
+    resolve_paths,
+)
 from .envelope import (
     EXIT_CANCELLED,
     EXIT_ERROR,
@@ -1058,7 +1064,7 @@ def gallery_dl_cmd(
     dest: str | None = typer.Option(None, "--dest", help="落点（默认 <library-root>\\00-Incoming\\Manga）"),
     apply: bool = typer.Option(False, "--apply", help="真正下载；不加就是**预检**（只模拟，不落盘）"),
     timeout: float = typer.Option(120.0, "--timeout", help="单次命令超时（秒）"),
-    config: str | None = typer.Option(None, "--config", help="gallery-dl 配置文件（透传给 gallery-dl 的 -c）"),
+    config: str | None = typer.Option(None, "--config", help="gallery-dl 配置文件（透传给 gallery-dl 的 -c）；给了就**替换**默认的合规命名配置"),
     option: list[str] = typer.Option(None, "-o", help="gallery-dl 选项覆盖（透传给 gallery-dl 的 -o key=value）"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
@@ -1068,6 +1074,11 @@ def gallery_dl_cmd(
     **默认预检**：`gallery-dl -s` 只模拟、不落盘 → 判断这个 URL 站不支持。
     不支持的 URL 明确返回「不支持」（退出码 4），**不会**发起下载。
     加 ``--apply`` 才真下载。落点同样受红线约束。
+
+    **默认套用「入库合规命名」配置**（``src/manga/data/gallery-dl-option.json``）：
+    gallery-dl 原生的目录格式产出 ``v01 c001`` 这类名字，**过不了**入库闸门
+    （命名规范要求 ``<话号> - <标题>.cbz``）。配置按站把模板改成合规形态。
+    ``--config`` 给的是**替换**（不是叠加）—— 想用上游原生命名就显式传一个配置。
 
     **透传**：``--config`` / ``-o`` / ``--`` 之后的参数原样转发给 gallery-dl
     （预检时不透传 —— 预检只回答「支不支持」）。
@@ -1079,8 +1090,16 @@ def gallery_dl_cmd(
 
         # 组装透传参数：--config → -c；-o 原样；-- 之后的原样
         passthrough: list[str] = []
-        if config:
-            passthrough.extend(["-c", config])
+        cfg = Path(config).expanduser() if config else default_gallery_dl_config()
+        if cfg.is_file():
+            passthrough.extend(["-c", str(cfg)])
+        elif config:
+            raise MangaError(
+                f"找不到 gallery-dl 配置文件：{cfg}",
+                code="CONFIG_MISSING",
+                exit_code=EXIT_NOTFOUND,
+                hint="检查 --config 的路径；或删掉它以用内置的合规命名配置",
+            )
         if option:
             for kv in option:
                 passthrough.extend(["-o", kv])

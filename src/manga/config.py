@@ -32,6 +32,8 @@ ENV_LIBRARY_ROOT = "MANGA_LIBRARY_ROOT"
 ENV_SCRIPTS_DIR = "MANGA_SCRIPTS_DIR"
 ENV_WORKSPACE = "MANGA_WORKSPACE"
 ENV_OPTION_FILE = "MANGA_OPTION_FILE"
+#: gallery-dl 配置文件（覆盖默认的「入库合规命名」模板）
+ENV_GALLERY_DL_CONFIG = "MANGA_GALLERY_DL_CONFIG"
 
 #: 本机默认书库根目录
 DEFAULT_LIBRARY_ROOT = Path.home() / "Documents" / "Library"
@@ -214,6 +216,21 @@ def default_option_file(workspace: Path | None) -> Path:
     if workspace is not None:
         return workspace / "jmcomic" / "option.yml"
     return bundled
+
+
+def default_gallery_dl_config() -> Path:
+    """默认 gallery-dl 配置：随包分发的「入库合规命名」模板。
+
+    gallery-dl 的默认目录格式产出 ``v01 c001`` 这类名字，**过不了** manga
+    工作区的入库闸门（命名规范要求 ``<话号> - <标题>.cbz``）。
+    本文件把各站的 ``directory``/``filename`` 模板改成合规形态。
+
+    生成与校验：``uv run python tools/gallery_dl_facts.py config|check``。
+    """
+    env = os.environ.get(ENV_GALLERY_DL_CONFIG)
+    if env:
+        return Path(env).expanduser()
+    return Path(__file__).resolve().parent / "data" / "gallery-dl-option.json"
 
 
 def resolve_paths(

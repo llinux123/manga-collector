@@ -88,6 +88,29 @@ _EXTRACTOR_RE = re.compile(r"using extractor ['\"](?P<name>[^'\"]+)['\"]", re.IG
 #: ``Title: xxx``
 _TITLE_RE = re.compile(r"^\s*title\s*[:=]\s*(?P<title>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 
+#: gallery-dl 的退出码是**位掩码**（见上游 ``job.py`` 的 ``self.status |= N``）：
+#:
+#: ======  ==========================================================
+#: 位      含义
+#: ======  ==========================================================
+#: 1       意外异常
+#: 2       OSError（读数据失败）
+#: 4       **部分文件下载失败**（``Failed to download xxx``）
+#: 8       挑战页（Cloudflare 等）
+#: 16      认证 / 授权失败
+#: 32      输入 / 配置错误（含「该 URL 没有提取器」）
+#: 128     解析失败（JSONDecodeError）
+#: ======  ==========================================================
+#:
+#: ⚠ **位 4 最要命**：产物 CBZ **已经写出来了**，只是少了几页。
+#: 上游退出码非 0 但产物存在 → **不能**当成功（那会让缺页的 CBZ 进库）。
+_EXIT_PARTIAL = 4
+_EXIT_AUTH = 16
+_EXIT_INPUT = 32
+
+#: ``Failed to download xxx``（位 4 的日志行）
+_FAILED_RE = re.compile(r"failed to download\s+(?P<name>\S+)", re.IGNORECASE)
+
 #: simulate 输出的目录树行：``└─ Series/001 - Chapter.cbz``
 _TREE_RE = re.compile(r"^[│\s]*[├└]─\s*(?P<label>.+?)\s*$")
 
@@ -645,6 +668,65 @@ def download(
                 "urls": url_list,
                 "exit_code": proc.returncode,
                 "stderr": _tail(stderr),
+            },
+        )
+
+    # 产物在，但退出码非 0 → **部分失败**。
+    #
+    # 最常见的是退出码位 4：某个文件下载失败（网络抖动 / SSL 断连），
+    # 但 CBZ **已经被写出来了**，只是少了几页。报 ok 会让缺页的 CBZ 进库，
+    # 之后入库闸门也查不出来（页数只要 ≥ 5 就「达标」）→ 必须在这一层拦下。
+    if proc.returncode != 0:
+        failed = [m.group("name") for m in _FAILED_RE.finditer(stderr)]
+        detail = _tail(stderr)
+        if proc.returncode & _EXIT_AUTH:
+            raise MangaError(
+                "gallery-dl 认证 / 授权失败（退出码含位 16）",
+                code="AUTH_FAILED",
+                exit_code=EXIT_ERROR,
+                hint=(
+                    "该站需要登录：按站点配 gallery-dl 的凭据"
+                    "（配置文件里的 username/password 或 cookies），"
+                    "不要把凭据写在命令行里"
+                ),
+                data={
+                    "dest": str(dest),
+                    "urls": url_list,
+                    "exit_code": proc.returncode,
+                    "files": produced,
+                    "stderr": detail,
+                },
+            )
+        if proc.returncode & _EXIT_PARTIAL:
+            raise MangaError(
+                "gallery-dl 部分文件下载失败（退出码含位 4）：产物已写出，但不完整",
+                code="PARTIAL_DOWNLOAD",
+                exit_code=EXIT_ERROR,
+                hint=(
+                    "缺页的文件："
+                    + ("、".join(failed[:10]) or "（见 stderr）")
+                    + "。**重跑同一条命令即可续传**（已下的不会重来）"
+                ),
+                data={
+                    "dest": str(dest),
+                    "urls": url_list,
+                    "exit_code": proc.returncode,
+                    "files": produced,
+                    "failed_files": failed,
+                    "stderr": detail,
+                },
+            )
+        raise MangaError(
+            f"gallery-dl 退出码 {proc.returncode}（产物已写出，但过程有错误）",
+            code="DOWNLOAD_FAILED",
+            exit_code=EXIT_ERROR,
+            hint=detail or None,
+            data={
+                "dest": str(dest),
+                "urls": url_list,
+                "exit_code": proc.returncode,
+                "files": produced,
+                "cwd": str(workdir),
             },
         )
 

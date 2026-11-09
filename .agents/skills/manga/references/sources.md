@@ -2,14 +2,13 @@
 
 > 版本核对日期 **2026-11-07**（GitHub Releases API / Codeberg API / 官方站点实抓）。
 >
-> **本机状态复核（2026-11-07）**：
-> - `gallery-dl` **已装 1.32.19**（scoop：`~/scoop/apps/gallery-dl/1.32.19`）✅ 与上表一致
+> **本机状态复核（2026-11-09）**：
+> - `gallery-dl` **已装 1.32.19**（**uv tool 版**：`~/.local/bin/gallery-dl.exe`）✅ 与上表一致
+>   - ⚠ 原来是 scoop 的 **PyInstaller 版** → 在受限环境里报
+>     `[PYI-xxxxx:ERROR] Failed to create parent directory structure`（**不是坏了**，
+>     是 PyInstaller 想在不可写的位置建目录）。**已换成 uv tool 版，问题根治**。
 > - `mangadex-dl` **本机未安装**（P3 做适配器前要先装）
 > - `jmcomic` / `jmv` 已装（2.7.11）✅
-> - ⚠ `gallery-dl.exe --version` 在受限环境下会报
->   `[PYI-xxxxx:ERROR] Failed to create parent directory structure.`
->   —— PyInstaller 想在不可写的位置建目录。**不是坏了**，换个可写的工作目录即可；
->   P3 的适配器要处理这个（先 chdir 到可写目录再调它）。
 
 ## 1. 选路矩阵
 
@@ -45,7 +44,9 @@ jmcomic p404005 p390442 --option ".\jmcomic\option.yml"           # 只下指定
 
 ### gallery-dl（通用）
 
-- 事实标准，268 个分类；**本机已装 1.32.19**（scoop），备选 `uv tool install gallery-dl`。
+- 事实标准，268 个分类；**本机已装 1.32.19**（`uv tool install`，路径 `~/.local/bin/gallery-dl.exe`），备选 `scoop install gallery-dl`。
+  - ⚠ **PyInstaller 版在受限环境里起不来**（`[PYI-xxxxx:ERROR] Failed to create parent directory structure`）。
+    换非 PyInstaller 版（`uv tool install gallery-dl`）即可根治。
 - **不写 ComicInfo.xml** → 由 `Invoke-LibraryIngest.ps1 -GenerateComicInfo` 或 ComicTagger 补。
 - **不提供** AniList / MyAnimeList / Bangumi 元数据（这三个分类不存在）。
 - **不收录**：知乎、豆瓣、小红书、抖音、B站视频、微信公众号、淘宝/京东，以及 bato.to、mangasee123、
@@ -53,8 +54,49 @@ jmcomic p404005 p390442 --option ".\jmcomic\option.yml"           # 只下指定
 - MangaDex 默认**不限语言**，要中文必须写 `lang=zh`。
 - 离线自检（不下载不联网）：`pwsh -File .\gallery-dl\Test-GalleryDlUrl.ps1 -Url "<URL>"`。
 
+#### ⚠ 命名：gallery-dl 原生模板**过不了入库闸门**
+
+gallery-dl 的原生目录格式是 `{volume:?v/ />02}c{chapter:>03}…` → 产出 **`v01 c001.cbz`** 这类名字：
+
+- 不符合命名规范（要求 `<卷或话号> - <标题>.cbz`）→ 校验器报 **Naming** 错误；
+- 话号解析不出来 → `ComicInfo.Number` 缺失 → 校验器报 **Metadata** 错误；
+- 原生模板还带 `{category}` 来源层 → 库内多一层 → 校验器报**「层级过深」**告警。
+
+**解法：本项目自带一份配置，把模板改成合规形态**
+（`src/manga/data/gallery-dl-option.json`，`manga gallery-dl` **默认套用**）：
+
+```
+<系列名>/<话号> - <标题>.cbz
+```
+
+- 配置是**按站**的 —— 各站提供的关键词不一样（`{manga}` / `{comic}` / `{issue}` / `{chapter}` …），
+  配错会渲染成 `None`；
+- 配置是**生成物**：`uv run python tools/gallery_dl_facts.py config`（重新生成）/
+  `… check`（校验是否仍与本机 gallery-dl 一致，漂移就非零退出）；
+- `--config <file>` 是**替换**默认配置（想用上游原生命名就显式传）。
+
+#### ⚠ 退出码是**位掩码**，位 4 = 部分文件下载失败
+
+`job.py` 里是 `self.status |= N`，所以：
+
+| 位 | 含义 |
+|---|---|
+| 1 | 意外异常 |
+| 4 | **部分文件下载失败**（`Failed to download xxx`） |
+| 8 | 挑战页 |
+| 16 | 认证 / 授权失败 |
+| 32 | 输入 / 配置错误（含「该 URL 没有提取器」） |
+| 128 | 解析失败 |
+
+⚠ **位 4 最要命**：产物 CBZ **已经写出来了**，只是少了几页。
+实测：MangaDex 一次 37 页的下载，第 26 页 SSL 断连 → 退出码 4，CBZ 却只有 36 页。
+适配层把它识别成 `PARTIAL_DOWNLOAD`（退出码 2）而**不是**成功 ——
+否则缺页的 CBZ 会进库，而入库闸门查不出来（页数只要 ≥ 5 就「达标」）。
+
+**重跑同一条命令即可续传**（已下的不会重来）。
+
 ```powershell
-gallery-dl -s "<URL>"                                   # 模拟，不落盘
+gallery-dl -s --no-input "<URL>"                                   # 模拟，不落盘
 gallery-dl --cbz -d "$env:USERPROFILE\Documents\Library\00-Incoming\Manga" "<URL>"
 ```
 

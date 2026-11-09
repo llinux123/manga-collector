@@ -90,10 +90,19 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 | 源 | 透传方式 |
 |---|---|
 | jmcomic | `--option <file>` 换一份变体配置（插件/threading/domain 全在里面） |
-| gallery-dl | `--config <file>` + `-o key=value`（可多次）+ `--` 之后的原样参数 |
+| gallery-dl | `--config <file>`（**替换**默认的合规命名配置）+ `-o key=value`（可多次）+ `--` 之后的原样参数 |
 | mangadex-dl | `--` 之后的原样参数 |
 
 预检（不加 `--apply`）**不透传** —— 预检只回答「支不支持」。
+
+### gallery-dl 的两个默认行为（不用传参就知道）
+
+1. **默认套用「入库合规命名」配置** —— gallery-dl 原生模板产出 `v01 c001` 这类名字，
+   **过不了**入库闸门（要求 `<话号> - <标题>.cbz`）。本项目自带配置把它改成合规形态，
+   `manga gallery-dl` 直接套用；要上游原生命名就显式 `--config <file>`。
+2. **退出码位 4 = 部分文件下载失败** —— 产物 CBZ 已写出但少了几页 → 报
+   `PARTIAL_DOWNLOAD`（退出码 2），**不是**成功。**重跑同一条命令即可续传**。
+
 
 ## 3. 输出契约（必须遵守）
 
@@ -141,6 +150,8 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 
 ```powershell
 # 通用站 / 图源（gallery-dl）—— P3 起由 CLI 封装
+# ⚠ 走 CLI（manga gallery-dl）才有「入库合规命名」；直接调原生命令会产出
+#    v01 c001 这类名字 → 过不了入库闸门。
 gallery-dl --cbz -d "$env:USERPROFILE\Documents\Library\00-Incoming\Manga" "<URL>"
 
 # MangaDex —— P3 起由 CLI 封装

@@ -13,8 +13,8 @@
 | [.agents/skills/manga/references/](.agents/skills/manga/references/) | 按需加载的知识：`pipeline` `troubleshooting` `jmcomic` `option-and-plugins` `naming` `sources` `servers` |
 | [src/manga/](src/manga/) | **薄 CLI**（20 个命令）：`paths` `doctor` `verify` `ingest` `convert-cbz` `guard` `search` `album` `comments` `download` `export` `domains` `pick-domain` `job *` `favorites` `checkin` `gallery-dl` `mangadex-dl` `actions-gen` `server *` `version` |
 | [config/jmcomic-option.yml](config/jmcomic-option.yml) | jmcomic 本机配置模板（`dir_rule.rule` 已修正，见下） |
-| [tests/](tests/) | pytest 用例（信封契约、退出码映射、红线守卫、dry-run 不落盘、DirRule 渲染回归、作业模型、references 同步性守护） |
-| [tools/](tools/) | 防腐烂工具：`jmcomic_facts.py`（源码事实提取）、`doc_claims.py`（文档声明核对） |
+| [tests/](tests/) | pytest 用例（信封契约、退出码映射、红线守卫、dry-run 不落盘、DirRule 渲染回归、作业模型、references 同步性守护、gallery-dl 合规命名与部分失败） |
+| [tools/](tools/) | 防腐烂工具：`jmcomic_facts.py`（源码事实提取）、`doc_claims.py`（文档声明核对）、`gallery_dl_facts.py`（gallery-dl 站点关键词 + 合规命名配置） |
 
 ## 与 manga 工作区的关系
 
@@ -206,7 +206,7 @@ uv run python tools/doc_claims.py check        # 声明核对：API/常量/异�
 |---|---|---|
 | **作业模型**（`manga job/*`） | ✅ | `start` 立刻返回 job id 并后台跑；`poll` 精简秒回；`cancel` 杀进程树并给**已完成 / 未完成**清单；`result` 拿子进程的信封。状态**由子进程自己写终态**（父进程启动完就退出，收不了尾）；`final.json` 与 `state.json` 分开以免互相覆盖 |
 | 作业取消 | ✅ | **协作式**：`job cancel` 只写取消标记，**子进程自己**看到后退出 —— 受限环境（沙箱/容器/CI）里外部杀「别的进程创建的进程」会被拒。实测：真实下载作业取消后子进程自行退出，`exited_by_itself=true` |
-| gallery-dl 适配层 | ✅ | `precheck()` 只模拟不落盘（`-s`），不支持的 URL 明确返回「不支持」；`download()` 递归找新增 CBZ，**0 产物报 NO_ARTIFACT**（防假成功）；识别 PyInstaller 的环境问题并与「URL 不支持」区分开（根因是 **TEMP 不可写**，不是 cwd） |
+| gallery-dl 适配层 | ✅ | `precheck()` 只模拟不落盘（`-s`），不支持的 URL 明确返回「不支持」；`download()` 递归找新增 CBZ，**0 产物报 NO_ARTIFACT**（防假成功）；识别 PyInstaller 的环境问题并与「URL 不支持」区分开（根因是 **TEMP 不可写**，不是 cwd）；**退出码位 4（部分文件失败）报 PARTIAL_DOWNLOAD 而非成功** |
 | mangadex-downloader 适配层 | ✅ | `--save-as cbz` + 逐包检查 ComicInfo.xml；未安装时 TOOL_MISSING（退出码 4） |
 | 收藏夹 / 签到 | ✅ | 走 jmcomic 的 `favorite_folder_export` 插件；zip 密码**只从环境变量**读且不回显；收藏夹清单也是灰色来源 → 落点进共享区直接**红线拒绝（退出码 6）**；无登录态 → 退出码 3 |
 | GitHub Actions 生成器 | ✅ | `download_dispatch.yml`（**恰好 10 个 inputs**）+ `export_favorites.yml`（cron + 手动）；生成后自检 YAML；**jmcomic 分支不产生任何 artifact**（红线内建）；secrets 清单 12 项，只有名字与说明 |
@@ -220,6 +220,23 @@ manga job result <job_id>                          # 终态摘要
 manga job cancel <job_id>                          # 真能停
 manga gallery-dl "<URL>"                           # 预检：支不支持
 manga actions-gen                                  # 生成 workflow（dry-run）
+```
+
+### gallery-dl 的「入库合规命名」（2026-11-09 实测补的坑）
+
+端到端跑通（下载 → 入库 → 验收）时发现两个**实测**出来的缺口，都已修：
+
+| 坑 | 现象 | 修法 |
+|---|---|---|
+| **原生命名过不了入库闸门** | gallery-dl 的原生目录模板产出 `v01 c001.cbz` → 命名不合规 + `ComicInfo.Number` 缺失 + 库内多一层来源目录 | 自带按站配置 `src/manga/data/gallery-dl-option.json`，`manga gallery-dl` **默认套用** → 产出 `<系列>/<话号> - <标题>.cbz`；`--config` 是**替换**默认 |
+| **退出码位 4 被当成成功** | gallery-dl 退出码是**位掩码**；位 4 = 部分文件下载失败 —— 产物 CBZ **已写出**但少了几页（实测 37 页只下了 36） | 适配层识别为 `PARTIAL_DOWNLOAD`（退出码 2）而不是 ok —— 否则缺页的 CBZ 会进库，而入库闸门查不出来（页数 ≥ 5 就「达标」） |
+
+配置是**生成物**（各站关键词不一样，配错会渲染成 `None`）：
+
+```powershell
+uv run python tools/gallery_dl_facts.py sites   # 各站可用关键词（Markdown 表）
+uv run python tools/gallery_dl_facts.py config  # 重新生成配置
+uv run python tools/gallery_dl_facts.py check   # 校验配置是否仍与本机 gallery-dl 一致（测试里也在跑）
 ```
 
 ### P4 当前进度
