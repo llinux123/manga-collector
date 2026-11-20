@@ -1458,28 +1458,33 @@ def mangadex_dl_cmd(
 def actions_gen_cmd(
     dest: str | None = typer.Option(None, "--dest", help="仓库根目录（workflow 写进 <dest>/.github/workflows）"),
     apply: bool = typer.Option(False, "--apply", help="真正写盘；不加只报告将要写什么"),
+    check: bool = typer.Option(False, "--check", help="**只做自检**（红线 / 脚本注入 / 10 个 inputs），不写盘"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
 ) -> None:
     """生成 GitHub Actions workflow（download_dispatch.yml + export_favorites.yml）。
 
     **默认 dry-run**：只报告将要写哪些文件；``--apply`` 才落盘。
+    ``--check`` 只跑自检（CI 用）：不写盘，自检不过 → 退出码 2。
     同时返回 secrets 清单（只有名字与说明，不含任何凭据）。
     """
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
         root = Path(dest).expanduser().resolve() if dest else Path.cwd()
-        data = actions_gen.write_workflows(root, apply=apply)
-        data["secrets"] = actions_gen.secrets_manifest()
-        data["validation"] = actions_gen.validate_workflows()
-        if not data["validation"]["ok"]:
+        validation = actions_gen.validate_workflows()
+        if not validation["ok"]:
             raise MangaError(
                 "生成的 workflow 没通过自检",
                 code="WORKFLOW_INVALID",
                 exit_code=EXIT_ERROR,
-                data=data,
+                data={"validation": validation},
             )
+        if check:
+            return Envelope(ok=True, data={"validation": validation, "check_only": True})
+        data = actions_gen.write_workflows(root, apply=apply)
+        data["secrets"] = actions_gen.secrets_manifest()
+        data["validation"] = validation
         return Envelope(
             ok=True,
             data=data,

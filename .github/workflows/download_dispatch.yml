@@ -1,0 +1,256 @@
+# ============================================================================
+# 由 `manga actions-gen` 生成 —— 请勿手工编辑
+# 改动请改 src/manga/actions_gen.py 后重新生成。
+#
+# ⚠ 红线（ADR-004）：灰色来源（jmcomic / 禁漫）的产物**绝不能**进入
+#    ① 共享区（Export/，Syncthing 同步到手机）
+#    ② 发布区（GitHub Release 等对外分发）
+#    → 本 workflow 的 jmcomic 分支**不产生任何 artifact / release**，
+#      且落点会在下载前被「红线检查」拦下。
+# ============================================================================
+name: manga download (dispatch)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "采集源：gallery-dl / mangadex / jmcomic（灰色来源，产物不上传）"
+        required: true
+        type: choice
+        default: gallery-dl
+        options:
+          - gallery-dl
+          - mangadex
+          - jmcomic
+      ids:
+        description: "要下的 ID 列表（逗号分隔；gallery-dl / mangadex 也接受 URL）"
+        required: true
+        type: string
+        default: ""
+      mode:
+        description: "album=整本下载 / photo=按章节下载"
+        required: true
+        type: choice
+        default: album
+        options:
+          - album
+          - photo
+      destination:
+        description: "落点目录（必须是收件箱；禁止指向 Export/ 共享区或 Manga/Library 权威库）"
+        required: true
+        type: string
+        default: "00-Incoming/Manga"
+      format:
+        description: "产物格式"
+        required: true
+        type: choice
+        default: cbz
+        options:
+          - cbz
+          - zip
+          - pdf
+          - longimg
+      language:
+        description: "语言过滤（zh / ja / en；留空 = 不限）"
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "只干跑不落盘（true = 不真正下载）"
+        required: false
+        type: boolean
+        default: true
+      include_comicinfo:
+        description: "是否生成 ComicInfo.xml"
+        required: false
+        type: boolean
+        default: true
+      min_pages:
+        description: "每话最少页数（低于此值判为残卷）"
+        required: false
+        type: number
+        default: 5
+      timeout_minutes:
+        description: "单次运行超时（分钟）"
+        required: false
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manga-download-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  download:
+    name: "下载 ${{ inputs.source }} → ${{ inputs.destination }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    env:
+      MANGA_LIBRARY_ROOT: "${{ secrets.MANGA_LIBRARY_ROOT }}"
+      MANGA_OPTION_FILE: "${{ secrets.MANGA_OPTION_FILE }}"
+      MANGA_SOURCE: "${{ inputs.source }}"
+      MANGA_MODE: "${{ inputs.mode }}"
+      MANGA_FORMAT: "${{ inputs.format }}"
+      MANGA_LANGUAGE: "${{ inputs.language }}"
+      MANGA_MIN_PAGES: "${{ inputs.min_pages }}"
+      MANGA_DRY_RUN: "${{ inputs.dry_run }}"
+      MANGA_COMICINFO: "${{ inputs.include_comicinfo }}"
+      # ⚠ 所有用户可填的 input 都在这里进环境变量。
+      #   run: 块里**只准**引用 "$MANGA_IDS" 这类变量 —— bash 会把环境变量的值
+      #   当**数据**而不是代码，直接把 "${{ inputs.ids }}" 插进 run: 等于
+      #   把用户的自由文本当 shell 代码执行（任意命令执行漏洞）。
+      MANGA_IDS: "${{ inputs.ids }}"
+      MANGA_DESTINATION: "${{ inputs.destination }}"
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: 安装本项目与依赖
+        run: uv pip install --system -e .
+
+      - name: 安装外部下载器（gallery-dl / mangadex-dl）
+        run: |
+          set -euo pipefail
+          # 不装的话，默认流程必然 TOOL_MISSING（退出码 4），workflow 永远跑不起来。
+          # 只装本项目、**不装**灰色来源的凭据。
+          uv tool install gallery-dl
+          uv tool install mangadex-dl
+          # 让 uv tool 装的命令在 PATH 上可见
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: 参数检查
+        shell: bash
+        env:
+          MANGA_IDS: "${{ inputs.ids }}"
+          MANGA_SOURCE: "${{ inputs.source }}"
+          MANGA_MODE: "${{ inputs.mode }}"
+          MANGA_DRY_RUN: "${{ inputs.dry_run }}"
+        run: |
+          set -euo pipefail
+          ids="${MANGA_IDS:-}"
+          if [ -z "${ids//[[:space:],]/}" ]; then
+            echo "::error::ids 为空：至少给一个 ID"
+            exit 1
+          fi
+          echo "源：${MANGA_SOURCE}｜模式：${MANGA_MODE}｜干跑：${MANGA_DRY_RUN}"
+
+      - name: 准备落点
+        shell: bash
+        env:
+          MANGA_DESTINATION: "${{ inputs.destination }}"
+        run: |
+          set -euo pipefail
+          mkdir -p "${MANGA_DESTINATION}"
+          echo "落点：${MANGA_DESTINATION}"
+
+      - name: "🛡 红线检查：灰色来源不得指向共享区 / 发布区"
+        if: inputs.source == 'jmcomic'
+        shell: bash
+        env:
+          MANGA_DESTINATION: "${{ inputs.destination }}"
+        run: |
+          set -euo pipefail
+          dest="${MANGA_DESTINATION}"
+          case "$dest" in
+            *[Ee]xport*|*[Ss]hared*|*[Rr]elease*|*[Pp]ublish*)
+              echo "::error::红线：jmcomic（灰色来源）的落点不得是共享区或发布区：$dest"
+              exit 1
+              ;;
+          esac
+          echo "红线检查通过：$dest 不是共享区 / 发布区"
+
+      - name: 下载（jmcomic · 灰色来源 · 产物不外传）
+        if: inputs.source == 'jmcomic'
+        shell: bash
+        env:
+          JM_USERNAME: "${{ secrets.JM_USERNAME }}"
+          JM_PASSWORD: "${{ secrets.JM_PASSWORD }}"
+          MANGA_IDS: "${{ inputs.ids }}"
+          MANGA_MODE: "${{ inputs.mode }}"
+          MANGA_DRY_RUN: "${{ inputs.dry_run }}"
+        run: |
+          set -euo pipefail
+          # ⚠ 灰色来源：产物只落在本次运行的临时目录，**本 workflow 不上传它**
+          dest=".work/raw-jmcomic"
+          mkdir -p "$dest"
+          read -r -a id_list <<< "$(printf '%s' "${MANGA_IDS}" | tr ',' ' ')"
+          apply_flag=""
+          if [ "${MANGA_DRY_RUN}" != "true" ]; then apply_flag="--apply"; fi
+          photo_flag=""
+          if [ "${MANGA_MODE}" = "photo" ]; then photo_flag="--photo"; fi
+          manga download "${id_list[@]}" --dest "$dest" $photo_flag $apply_flag \
+            --library-root "${MANGA_LIBRARY_ROOT:-$PWD/Library}"
+
+      - name: 下载（gallery-dl）
+        if: inputs.source == 'gallery-dl'
+        shell: bash
+        env:
+          MANGA_IDS: "${{ inputs.ids }}"
+          MANGA_DRY_RUN: "${{ inputs.dry_run }}"
+          MANGA_DESTINATION: "${{ inputs.destination }}"
+        run: |
+          set -euo pipefail
+          read -r -a url_list <<< "$(printf '%s' "${MANGA_IDS}" | tr ',' ' ')"
+          apply_flag=""
+          if [ "${MANGA_DRY_RUN}" != "true" ]; then apply_flag="--apply"; fi
+          # format 目前只有 cbz 真的实现了（gallery-dl --cbz）；其余值经环境变量 MANGA_FORMAT 预留
+          manga gallery-dl "${url_list[@]}" --dest "${MANGA_DESTINATION}" $apply_flag
+
+      - name: 下载（mangadex）
+        if: inputs.source == 'mangadex'
+        shell: bash
+        env:
+          MANGA_IDS: "${{ inputs.ids }}"
+          MANGA_DRY_RUN: "${{ inputs.dry_run }}"
+          MANGA_LANGUAGE: "${{ inputs.language }}"
+          MANGA_DESTINATION: "${{ inputs.destination }}"
+        run: |
+          set -euo pipefail
+          read -r -a url_list <<< "$(printf '%s' "${MANGA_IDS}" | tr ',' ' ')"
+          apply_flag=""
+          if [ "${MANGA_DRY_RUN}" != "true" ]; then apply_flag="--apply"; fi
+          lang_flag=()
+          if [ -n "${MANGA_LANGUAGE:-}" ]; then lang_flag=(--language "${MANGA_LANGUAGE}"); fi
+          manga mangadex-dl "${url_list[@]}" --dest "${MANGA_DESTINATION}" $apply_flag "${lang_flag[@]}"
+
+      - name: 入库 + 校验（闸门）
+        if: inputs.dry_run == false
+        shell: bash
+        env:
+          MANGA_COMICINFO: "${{ inputs.include_comicinfo }}"
+          MANGA_MIN_PAGES: "${{ inputs.min_pages }}"
+        run: |
+          set -euo pipefail
+          comicinfo_flag=()
+          if [ "${MANGA_COMICINFO}" = "true" ]; then comicinfo_flag=(--generate-comicinfo); fi
+          manga ingest --apply "${comicinfo_flag[@]}" --library-root "${MANGA_LIBRARY_ROOT:-$PWD/Library}"
+          manga verify --min-pages "${MANGA_MIN_PAGES}" --library-root "${MANGA_LIBRARY_ROOT:-$PWD/Library}"
+
+      - name: 上传产物（非灰色来源 · 非干跑）
+        # ⚠ 干跑没有产物 → 配合 if-no-files-found: error 会让 workflow 直接失败，
+        #   所以必须同时排除 dry_run。
+        if: inputs.source != 'jmcomic' && inputs.dry_run == false
+        uses: actions/upload-artifact@v4
+        with:
+          name: "manga-${{ inputs.source }}-${{ github.run_id }}"
+          path: "${{ inputs.destination }}"
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: 灰色来源产物不外传（显式说明）
+        if: inputs.source == 'jmcomic'
+        shell: bash
+        run: |
+          echo "::notice::jmcomic 属于灰色来源：产物只留在本次运行的临时目录，"
+          echo "::notice::不产生 artifact、不发布到 release，也不得同步到共享区 Export/。"

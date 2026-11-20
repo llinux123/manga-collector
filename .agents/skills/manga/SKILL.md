@@ -92,6 +92,11 @@ CBZ 的 `ComicInfo.xml`（`<Notes>jm:<id></Notes>` + `<Web>https://18comic.vip/a
 `Export\Manga`（共享区）或 `Manga\Library`（权威库）→ **退出码 6**，这是代码强制的，改参数绕不过去。
 透传参数（`--option` / `--config` / `-o` / `--`）里的路径也会被扫 —— 指向红线目录一样拒。
 
+⚠ **`--option` 变体里的插件也要过红线**：jmcomic 的 `zip` / `img2pdf` / `long_img` /
+`download_cover` 等插件**自带输出目录参数**（`zip_dir` / `pdf_dir` / `img_dir` …），
+只覆盖 `dir_rule.base_dir` 挡不住它们。CLI 在**构造 option 阶段**就把这些目录逐个校验，
+命中共享区/权威库 → 退出码 6；不在白名单里的插件一律拒绝（宁可误拒，不可漏放）。
+
 **透传约定**（各源的高级能力不逐个映射成 CLI 参数）：
 
 | 源 | 透传方式 |
@@ -123,13 +128,24 @@ CBZ 的 `ComicInfo.xml`（`<Notes>jm:<id></Notes>` + `<Web>https://18comic.vip/a
 | exit | 含义 | 你怎么办 |
 |---|---|---|
 | 0 | 成功（**可能带 warnings**） | 读 `data`，把 `warnings` 一并转述给用户 |
-| 1 | 参数 / 用法错 | 照 `error.message` 改参数，不重试 |
+| 1 | 参数 / 用法错（`BAD_USAGE`） | 照 `error.message` 改参数，不重试。**用法错也是 JSON 信封**，stdout 不会出现帮助文本 |
 | 2 | 执行错误 | 读 `error.hint`（含脚本输出尾部），定位后再试 |
 | 3 | 需要登录 / 凭据 | 见 §4 |
 | 4 | 资源不存在 | 核对路径，或先跑 `manga doctor` |
+| 5 | 被取消 | 见 §9 |
 | 6 | **红线拒绝** | **不要绕过、不要重试、不要换命令绕过**，见 §5 |
 
 `ok: false` 时**绝不**把这一轮说成「已完成」。`warnings` 非空时要提一句。
+
+**常见 exit 2 的错误码**（在 `error.code` 里）：
+
+| code | 含义 | 你怎么办 |
+|---|---|---|
+| `PARTIAL_DOWNLOAD` | 部分 ID 下载失败，但已有产物 | 报给用户；**重跑同一条命令即可续传** |
+| `NO_ARTIFACT` | 「下载成功」但 0 张图落盘（假成功防护） | 别当成成功；查 ID 与代理 |
+| `CORRUPT_ARTIFACT` | 产物里有读不动的 CBZ | 删掉坏包后重跑同一条命令 |
+| `SCRIPT_ERROR` | PowerShell 脚本异常终止 | 看 `error.hint`（stderr 尾部） |
+| `CANCEL_FAILED` | 取消**没生效**（子进程还在跑） | **别重跑**！先让用户结束那个进程 |
 
 ## 4. 登录与凭据
 
@@ -235,6 +251,11 @@ manga job cancel <job_id>                            # 真能停：给已完成 
 **作业取消是协作式的**：`job cancel` 只写一个取消标记，**子进程自己**看到后退出
 （受限环境里外部杀「别的进程创建出来的进程」常被拒 —— 沙箱、容器、CI 都这样）。
 所以取消后最多等几秒，作业就会变成 `cancelled`；`job result` 里能看到已完成/未完成清单。
+
+⚠ **取消只在「确认子进程真的退出了」之后才生效**：如果取消标记写不进去
+（目录不可写）**且**强杀又被环境拒绝，CLI 会报 `CANCEL_FAILED`（退出码 2）
+并**保持作业状态不变** —— 因为子进程还在下载、还在往库里写文件。
+这时候**不要重跑**（两个任务会互相踩），先让用户在宿主上结束那个进程。
 
 **两级取消**（jmcomic）：看门狗看到标记 → 先调 `DownloadControl.cancel()`（给 jmcomic
 一个在下一个检查点**优雅停下**的机会，保留已下载的进度）→ 等 5 秒还没退出 → `os._exit` 强退。

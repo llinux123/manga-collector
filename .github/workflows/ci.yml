@@ -1,0 +1,91 @@
+# ============================================================================
+# manga-collector 的 CI
+#
+# 目标：每次 push / PR 都验一遍「不会悄悄坏掉」的三件事：
+#   1. 测试全绿（pytest）；
+#   2. 文档声明与代码一致（tools/doc_claims.py）—— 上游升级后 references 漂移会当场报；
+#   3. jmcomic 事实表与源码一致（tools/jmcomic_facts.py）—— 插件 kwargs / DirRule 变量漂移。
+#
+# ⚠ 不跑真实下载：那是「本机实机」的事，由 JM_LIVE=1 手动触发（见 tests/test_live_smoke.py）。
+# ============================================================================
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 测试 + 事实核对（Python ${{ matrix.python-version }}）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14"]
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ matrix.python-version }}"
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: 安装本项目与依赖
+        run: |
+          set -euo pipefail
+          uv venv --python "${{ matrix.python-version }}"
+          # uv 会优先用项目里的 uv.lock（锁版本，可复现）
+          uv sync --locked --all-extras
+          uv pip install --python .venv/bin/python pytest
+
+      - name: 跑测试
+        # --basetemp 落在工作区内：CI 的临时目录也不该写到别处
+        run: |
+          set -euo pipefail
+          .venv/bin/python -m pytest -q --basetemp="${RUNNER_TEMP}/pytest-tmp"
+
+      - name: 核对文档声明（references ↔ 源码）
+        run: .venv/bin/python tools/doc_claims.py check
+
+      - name: 核对 jmcomic 事实表（插件 kwargs / DirRule 变量）
+        run: .venv/bin/python tools/jmcomic_facts.py check
+
+  workflow-lint:
+    name: 生成的 workflow 自检（红线 + 脚本注入）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: 安装本项目与依赖
+        run: |
+          set -euo pipefail
+          uv venv --python "3.14"
+          uv sync --locked --all-extras
+
+      - name: 校验生成的 Actions workflow
+        # 校验器会拦：inputs 插进 run:（脚本注入）、红线缺失、10 个 inputs 不齐
+        run: .venv/bin/python -m manga actions-gen --check

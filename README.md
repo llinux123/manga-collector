@@ -262,6 +262,35 @@ uv run python tools/gallery_dl_facts.py check   # 校验配置是否仍与本机
 | 锁版本 + 升级流程 | ✅ | README 新增「版本锁定与升级流程」：升 jmcomic 必须走 `jmcomic_facts check` → `doc_claims check` → pytest → JM_LIVE 冒烟，否则 references 会悄悄过期 |
 | 真机冒烟（JM_LIVE=1） | ✅ 测试已就绪 | `tests/test_live_smoke.py`：2 章下载 → CBZ → 入库 → `verify --series` 退出码 0 → 共享区零新增。默认跳过，`$env:JM_LIVE="1"` 才跑（需联网 + 代理） |
 
+### P6 当前进度（稳定性审计修复）
+
+一次「代码探索 + 检验」审计发现的**假成功**与**状态失真**，逐条修掉。每条都是
+「报成功但实际没成」或「状态说一套、实际另一套」：
+
+| 类别 | 问题 | 修法 |
+|---|---|---|
+| **P0 · 密码泄漏** | 收藏夹加密 zip 的密码被上游插件拼进 `subprocess.run(shell=True)` 的命令串并写进日志 → 密码进 stderr / 日志 / 进程命令行 | 改为**进程内** pyzipper AES-256 打包；密码只在内存里，不进任何 argv 与日志；缺 pyzipper → `DEP_MISSING`（退出码 4） |
+| **P0 · 红线绕过** | `--option` 变体里的 `zip` / `img2pdf` / `long_img` 等插件**自带输出目录参数**，只覆盖 `dir_rule.base_dir` 挡不住 → 灰色产物能落到共享区 | 构造 option 阶段按**白名单 + 输出目录键**逐一校验，命中共享区/权威库 → 退出码 6；不在名单里的插件一律拒绝 |
+| **P1 · 假成功** | jmcomic 作业模式把上游 `BatchResult.failed` 里的失败 ID 记成 `done` | 读 `failed` 并发 `failed` 事件；`--apply` 下有失败或 0 产物 → `PARTIAL_DOWNLOAD` / `NO_ARTIFACT`（退出码 2） |
+| **P1 · 假成功** | PowerShell 脚本退出码 3/127/255/-1 被判成功（`ok=true`） | 意外退出码一律判失败；exit 1 且解析不出报告块 + stderr 非空 → `SCRIPT_ERROR`（exit 1 仍是告警的那条路保留） |
+| **P1 · 假成功** | mangadex-dl 退出码非 0 但产物已写出 → 直接报 ok；坏包（读不动的 CBZ）一路走进库 | 非 0 → `DOWNLOAD_FAILED`；坏包 → `CORRUPT_ARTIFACT`；缺 `ComicInfo.xml` → `warnings` 冒到信封顶层 |
+| **P1 · 状态失真** | `job cancel` 写不了标记 + 强杀被拒时**仍报 cancelled**（子进程还在下载、还在写库） | 抛 `CANCEL_FAILED`（退出码 2）并**保持状态不变**；CTRL_BREAK / SIGTERM 必须轮询确认进程真退出 |
+| **P1 · 状态失真** | 作业 `finalize` 只看退出码：`exit=0` 但信封 `ok=false` 也判 succeeded | 要求 `exit==0` **且** `ok` 非 false |
+| **P1 · 状态失真** | `job list` 直接读 `state.json`（永远是 running）；终态作业的耗时每次轮询都涨 | 列表改用 `_effective_state`；耗时优先用 `finished_at` |
+| **P1 · 契约破损** | Typer/Click 的用法错误打 Rich 面板到 stderr、stdout 空、退出码 2 → agent 分不清「参数错」还是「执行错」 | 统一输出 `BAD_USAGE` 信封（退出码 1）；`--help` 仍走人类可读路径 |
+| **P1 · 安全** | 生成的 Actions workflow 把 `${{ inputs.ids }}` 直接插进 `run:` → 用户可填的自由文本被 bash 当代码执行 | 所有 inputs 先经 `env:` 进环境变量，`run:` 里只引用 `$VAR`；**校验器把这种模板判为不合法** |
+| **P1 · 不可跑** | 生成的 workflow 不装 gallery-dl / mangadex-dl → 必然 `TOOL_MISSING`；干跑时也上传产物，`if-no-files-found: error` 让干跑必挂 | 按来源装外部下载器；上传步骤同时排除 `dry_run` |
+| **P1 · 查重漏判** | 库是「来源名/书名」两层结构时，标题归一化把来源名也算进去 → `lookup --title "My Work"` 永远匹配不上明明在库的书 | `title_norm` 只取叶子目录名（书名）；`series` 仍保留完整相对路径 |
+| **P2 · 版本错乱** | 版本号写死在两处（pyproject `0.1.0` / `__init__` `0.2.0`） | 只认 `importlib.metadata`；兜底常量由测试守住与 pyproject 一致；版本升到 **0.3.0** |
+| **P2 · 并发丢数据** | `record_progress` 的「读→改→写」无锁（子进程是多线程）→ 进度里少了已完成的 ID，agent 重复下载 | 加进程内锁；原子写的临时文件名与写权限探针改成**唯一名**（固定名会让并发写互相覆盖 / 互相删探针） |
+| **P2 · 静默丢弃** | `working_directory` 只 mkdir + chdir，不探写权限 → 日志被静默丢掉，排查时什么都看不到 | 写一个唯一名探针文件再删；写不进去 → 明确降级 |
+| **D1 · 装上不能用** | wheel 只带 gallery-dl 配置，**不带默认 jmcomic option** → 装成工具后 `manga download` 连 option 都找不到 | 随包分发**机器无关的通用模板**（`manga/data/jmcomic-option.yml`，不含本机路径与代理）；查找顺序：环境变量 → 仓库 → 随包 → 工作区；sdist 带上 `config/` |
+| **D3 · 没有闸门** | 仓库里没有 CI | 新增 `.github/workflows/ci.yml`：pytest + `doc_claims check` + `jmcomic_facts check` + 生成物自检 |
+
+> 🔒 灰色来源（禁漫）的产物**任何时候都不进** `Export\Manga`（Syncthing 共享区）与
+> `Manga\Library`（权威库）—— 这条红线在代码里强制（退出码 6），文档与测试同时守住。
+
+
 ## 版本锁定与升级流程
 
 ### 锁版本

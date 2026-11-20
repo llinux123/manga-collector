@@ -1,0 +1,83 @@
+# ============================================================
+#  jmcomic 配置文件 —— **通用模板**（随 manga-collector 分发）
+#  jmcomic 2.7.11
+#
+#  这份文件是「装上就能用」的兜底：装成工具后不在仓库里，
+#  `manga download` 找不到 option 就一条命令都用不了。
+#
+#  ⚠ 与 config/jmcomic-option.yml 的区别：
+#     那份是**本机实机配置**（含本机绝对路径与代理设置），不随包分发；
+#     这份是**机器无关的通用模板** —— 落点由 CLI 强制覆盖（见下）。
+#
+#  优先级（config.default_option_file）：
+#     1. 环境变量 MANGA_OPTION_FILE
+#     2. 仓库内的 config/jmcomic-option.yml（源码树里跑时）
+#     3. 本文件（随包分发 → manga/data/jmcomic-option.yml）
+#     4. manga 工作区的 jmcomic/option.yml
+#
+#  想用实机配置：设 MANGA_OPTION_FILE，或给命令加 --option <变体.yml>。
+# ============================================================
+
+version: '2.1'
+log: true
+
+# ── 登录 ────────────────────────────────────────────────────────────
+# 大部分本子无需登录；收藏夹 / 签到 / 敏感题材才需要。
+# 凭据走环境变量，**不要**写进文件（文件会被打进 sdist / 复制给别人）。
+auth:
+  username: ${JM_USERNAME}
+  password: ${JM_PASSWORD}
+  # 浏览器 cookies（仅 impl: html；cookies 必须来自实际访问的域名）
+  # cookies:
+  #   AVS: <AVS 值>
+
+# ── 客户端 ──────────────────────────────────────────────────────────
+client:
+  impl: api                    # api=APP端（不限 IP、稳定）；html=网页端（效率高但限制 IP 地区）
+  async_impl: null
+  domain: []                   # 留空=自动；域名全挂时见 manga pick-domain
+  retry_times: 5
+  cache: true                  # 元数据缓存，减少重复请求
+  postman:
+    type: curl_cffi
+    meta_data:
+      headers: null
+      impersonate: chrome
+      # 不写死代理：境内直连即可；需要代理时把下面改成 "host:port"，
+      # 或写 "system" 跟随系统代理，或 null 明确直连。
+      proxies: null
+
+# ── 下载 ────────────────────────────────────────────────────────────
+download:
+  cache: true                  # 磁盘已有文件不重复下载（断点续传）
+  image:
+    decode: true               # ★ 必须开：还原站点的混淆图，否则下到的是乱码路径
+    suffix: null               # null = 保持原始格式（不重编码，符合本项目「只重打包不重编码」铁律）
+  threading:
+    image: 4                   # 同时下载图片数（站点单次上限 50；网络差就调到 10）
+    photo: 1                   # 同时下载章节数（低并发；补下时逐章串行）
+
+# ── 落盘目录 ────────────────────────────────────────────────────────
+dir_rule:
+  # ★ 落点**由 CLI 强制覆盖**（--dest / 默认收件箱旁的暂存区），
+  #   这里写的只是占位 —— 红线守卫在 CLI 层生效，共享区/权威库一律拒绝。
+  base_dir: .
+  # <本子标题>/<章节名> —— 这样转换脚本能同时拿到系列名与话号
+  #
+  # ⚠ 分隔符与写法必须配套，**不能混用**：
+  #   「/」分隔 → 段内不能带 "Bd_" 前缀（`Bd/Atitle/Pname` ✅，`Bd_Atitle/Pname` ❌ 会生成字面量目录 Bd_Atitle）
+  #   「_」分隔 → 段内不能用 "/"        （`Bd_Atitle_Pname` ✅）
+  #   f-string 写法必须用「/」分隔     （`Bd / {Atitle} / {Pname}` ✅）
+  rule: Bd/Atitle/Pname
+  normalize_zh: null           # 繁简统一：zh-cn / zh-tw / null
+
+# ── 插件 ────────────────────────────────────────────────────────────
+plugins:
+  dependencies_strategy: failed-fast
+  valid: log
+  after_init:
+    - plugin: advanced_retry   # 域名多轮轮询 + 单域名失败上限，站点抽风时救命
+      kwargs:
+        retry_config:
+          retry_rounds: 3
+          retry_domain_max_times: 5

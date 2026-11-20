@@ -29,9 +29,13 @@ packages = ["src/manga"]
 # 随包分发 gallery-dl 的「入库合规命名」配置 —— 装成工具后也要能找到
 [tool.hatch.build.targets.wheel.force-include]
 "src/manga/data/gallery-dl-option.json" = "manga/data/gallery-dl-option.json"
+# 默认 jmcomic option 也必须随包走：装成工具后不在仓库里，
+# 没有它 `manga download` 连 option 都找不到（一条命令都用不了）。
+# 分发的是**机器无关的通用模板**（不含本机路径与代理）。
+"src/manga/data/jmcomic-option.yml" = "manga/data/jmcomic-option.yml"
 
 [tool.hatch.build.targets.sdist]
-include = ["src/manga", "tools", "tests", "docs", "README.md"]
+include = ["src/manga", "tools", "tests", "docs", "config", "README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

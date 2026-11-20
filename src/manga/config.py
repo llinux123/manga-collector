@@ -213,13 +213,26 @@ def default_profile_dir() -> Path:
 
 
 def default_option_file(workspace: Path | None) -> Path:
-    """默认 option 文件：优先本项目自带的模板，其次 manga 工作区的实机配置。"""
+    """默认 option 文件的查找顺序（**从具体到通用**）：
+
+    1. 环境变量 ``MANGA_OPTION_FILE`` —— 用户显式指定，最高优先；
+    2. 仓库内的 ``config/jmcomic-option.yml`` —— 源码树里跑时的实机配置；
+    3. **随包分发的** ``manga/data/jmcomic-option.yml`` —— 装成工具后的兜底
+       （不在仓库里时只有它了；没有它 ``manga download`` 连 option 都找不到）；
+    4. manga 工作区的 ``jmcomic/option.yml`` —— 实机配置的最后兜底。
+
+    ⚠ 第 3 步是随包分发的**通用模板**（机器无关）：落点由 CLI 强制覆盖，
+    凭据走环境变量 —— 绝不把本机绝对路径与代理打进 wheel。
+    """
     env = os.environ.get(ENV_OPTION_FILE)
     if env:
         return Path(env).expanduser()
     bundled = REPO_ROOT / "config" / "jmcomic-option.yml"
     if bundled.is_file():
         return bundled
+    packaged = Path(__file__).resolve().parent / "data" / "jmcomic-option.yml"
+    if packaged.is_file():
+        return packaged
     if workspace is not None:
         return workspace / "jmcomic" / "option.yml"
     return bundled

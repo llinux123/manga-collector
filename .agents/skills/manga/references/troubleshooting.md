@@ -46,11 +46,29 @@ manga doctor      # PowerShell？脚本在不在？jmcomic 装没装？代理端
 | exit | 含义 | 处理 |
 |---|---|---|
 | 0 | 成功 | 看 `data`；`warnings` 非空要转述 |
-| 1 | 用法错 | 照 `error.message` 改参数 |
+| 1 | 用法错（`BAD_USAGE`） | 照 `error.message` / `error.hint` 改参数。**用法错也有 JSON 信封** —— stdout 永远是那个信封，不会是 Typer 的帮助文本 |
 | 2 | 执行错误 | `error.hint` 里有脚本输出尾部 |
 | 3 | 需要凭据 | 见 SKILL.md §4 |
 | 4 | 资源不存在 | 跑 `manga doctor`；或 `--scripts-dir` 指错 |
+| 5 | 被取消 | 见 §5d |
 | 6 | 红线拒绝 | **停下报告，不要绕过** |
+
+**常见的 exit 2 错误码**（`error.code`）：
+
+| code | 含义 | 处理 |
+|---|---|---|
+| `PARTIAL_DOWNLOAD` | 部分 ID 下载失败（但已有产物） | 看 `data.failed`；**重跑同一条命令即可续传** |
+| `NO_ARTIFACT` | 下载「成功」但 0 张图落盘（假成功防护） | 确认 ID 有效、代理可用；先 `manga album <id>` 看章节数 |
+| `CORRUPT_ARTIFACT` | mangadex-dl 产出了读不动的 CBZ（坏包） | 删掉 `data.unreadable` 里的文件后重跑同一条命令 |
+| `SCRIPT_ERROR` | PowerShell 脚本异常终止（退出码 1 且解析不出报告） | 看 `error.hint`（stderr 尾部） |
+| `CANCEL_FAILED` | 取消**没生效**（子进程还在跑） | 别重跑！先在宿主上结束那个进程，或用协作式取消 |
+| `OPTION_INVALID` | option 文件解析失败 | 检查 YAML 缩进与字段拼写 |
+| `WORKFLOW_INVALID` | 生成的 Actions workflow 没通过自检 | 修 `src/manga/actions_gen.py` 里的模板 |
+
+**退出码 5（被取消）的诚实语义**：`job cancel` 只有在**确认子进程真的退出了**
+之后才会把状态写成 `cancelled`。取消标记写不进去、强杀又被环境拒绝时，
+它会抛 `CANCEL_FAILED`（退出码 2）并**保持状态不变** —— 因为子进程还在下载、
+还在往库里写文件，骗 agent 说「已停」会导致重复任务互相踩。
 
 ## 5. 环境类
 
@@ -70,6 +88,7 @@ manga doctor      # PowerShell？脚本在不在？jmcomic 装没装？代理端
 | 现象 | 处理 |
 |---|---|
 | `DEP_MISSING`：导出缺少 `img2pdf` | 退出码 **4**（缺东西，不是执行错）。`uv pip install img2pdf`（`--format longimg` 缺的是 `pillow`；加密 zip 缺 `pyzipper`/`py7zr`；加密 pdf 缺 `pikepdf`）。**CLI 不会自动装**，它只给命令 |
+| 收藏夹加密 zip 报 `DEP_MISSING`（pyzipper） | 退出码 **4**。`uv pip install pyzipper` | 收藏夹的加密 zip 在**进程内**用 pyzipper 的 AES-256 完成（上游插件的加密路径会把密码拼进 shell 命令并写日志，本项目**绝不调用**它）→ 产物是 **AES 加密 zip**（不是传统 ZipCrypto），用 7-Zip / WinRAR / `unzip -P` 都能解 |
 | `TOOL_MISSING`：找不到 `gallery-dl` / `mangadex-dl` | 退出码 **4**（同上：缺东西）。hint 里给安装命令（`uv tool install gallery-dl` / `scoop install gallery-dl`）。**CLI 不会自动装** |
 | `ENV_PYINSTALLER`：gallery-dl 报 `Failed to create parent directory structure` | 不是 URL 问题，是 **PyInstaller 版 gallery-dl 要往临时目录解压运行时**，而受限环境的临时目录不可写。本适配层已把 `TEMP`/`TMP` 指到可写目录；仍失败就换非 PyInstaller 版（`uv tool install gallery-dl`） |
 | `auth.logged_in = false` 但有 `has_username`/`has_password` | 那只是**凭据**不是登录态 —— 下载时 jmcomic 才会去登录。失败点会出现在下载阶段（退出码 3），不在配置阶段 |

@@ -1,0 +1,72 @@
+# ============================================================================
+# 由 `manga actions-gen` 生成 —— 请勿手工编辑
+# 改动请改 src/manga/actions_gen.py 后重新生成。
+#
+# 每天定时导出收藏夹清单（CSV + 可选密码 zip），产物以 artifact 形式留存。
+#
+# ⚠ 红线：收藏夹里可能混有灰色来源（jmcomic）的条目 →
+#    artifact 是**仓库私有产物**，不得发布到 release、不得同步到共享区 Export/。
+# ============================================================================
+name: manga export favorites
+
+on:
+  schedule:
+    # 每天 03:17 —— 避开整点（整点提交会被 GitHub 排队丢弃）
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: 导出收藏夹清单
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MANGA_LIBRARY_ROOT: "${{ secrets.MANGA_LIBRARY_ROOT }}"
+      MANGA_OPTION_FILE: "${{ secrets.MANGA_OPTION_FILE }}"
+      JM_USERNAME: "${{ secrets.JM_USERNAME }}"
+      JM_PASSWORD: "${{ secrets.JM_PASSWORD }}"
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: 安装本项目与依赖
+        run: uv pip install --system -e .
+
+      - name: 导出收藏夹
+        shell: bash
+        env:
+          MANGA_ZIP_PASSWORD: "${{ secrets.MANGA_ZIP_PASSWORD }}"
+        run: |
+          set -euo pipefail
+          mkdir -p "$PWD/.work/favorites"
+          # 收藏夹是**灰色来源的书单** → 落点绝不能是共享区（CLI 自己也会拦）
+          if [ -n "${MANGA_ZIP_PASSWORD:-}" ]; then
+            manga favorites --dest "$PWD/.work/favorites" --zip
+          else
+            manga favorites --dest "$PWD/.work/favorites"
+          fi
+
+      - name: 上传清单（artifact · 私有产物）
+        uses: actions/upload-artifact@v4
+        with:
+          name: "manga-favorites-${{ github.run_id }}"
+          path: ".work/favorites"
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 红线提示
+        shell: bash
+        run: |
+          echo "::notice::收藏夹清单可能含灰色来源条目：只作为 artifact 私有留存，"
+          echo "::notice::不发布到 release、不进共享区 Export/。"

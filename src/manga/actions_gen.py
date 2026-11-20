@@ -161,6 +161,12 @@ jobs:
       MANGA_MIN_PAGES: "${{ inputs.min_pages }}"
       MANGA_DRY_RUN: "${{ inputs.dry_run }}"
       MANGA_COMICINFO: "${{ inputs.include_comicinfo }}"
+      # ⚠ 所有用户可填的 input 都在这里进环境变量。
+      #   run: 块里**只准**引用 "$MANGA_IDS" 这类变量 —— bash 会把环境变量的值
+      #   当**数据**而不是代码，直接把 "${{ inputs.ids }}" 插进 run: 等于
+      #   把用户的自由文本当 shell 代码执行（任意命令执行漏洞）。
+      MANGA_IDS: "${{ inputs.ids }}"
+      MANGA_DESTINATION: "${{ inputs.destination }}"
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -176,30 +182,49 @@ jobs:
       - name: 安装本项目与依赖
         run: uv pip install --system -e .
 
-      - name: 参数检查
-        shell: bash
+      - name: 安装外部下载器（gallery-dl / mangadex-dl）
         run: |
           set -euo pipefail
-          ids="${{ inputs.ids }}"
+          # 不装的话，默认流程必然 TOOL_MISSING（退出码 4），workflow 永远跑不起来。
+          # 只装本项目、**不装**灰色来源的凭据。
+          uv tool install gallery-dl
+          uv tool install mangadex-dl
+          # 让 uv tool 装的命令在 PATH 上可见
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: 参数检查
+        shell: bash
+        env:
+          MANGA_IDS: "${{ inputs.ids }}"
+          MANGA_SOURCE: "${{ inputs.source }}"
+          MANGA_MODE: "${{ inputs.mode }}"
+          MANGA_DRY_RUN: "${{ inputs.dry_run }}"
+        run: |
+          set -euo pipefail
+          ids="${MANGA_IDS:-}"
           if [ -z "${ids//[[:space:],]/}" ]; then
             echo "::error::ids 为空：至少给一个 ID"
             exit 1
           fi
-          echo "源：${{ inputs.source }}｜模式：${{ inputs.mode }}｜干跑：${{ inputs.dry_run }}"
+          echo "源：${MANGA_SOURCE}｜模式：${MANGA_MODE}｜干跑：${MANGA_DRY_RUN}"
 
       - name: 准备落点
         shell: bash
+        env:
+          MANGA_DESTINATION: "${{ inputs.destination }}"
         run: |
           set -euo pipefail
-          mkdir -p "${{ inputs.destination }}"
-          echo "落点：${{ inputs.destination }}"
+          mkdir -p "${MANGA_DESTINATION}"
+          echo "落点：${MANGA_DESTINATION}"
 
       - name: "🛡 红线检查：灰色来源不得指向共享区 / 发布区"
         if: inputs.source == 'jmcomic'
         shell: bash
+        env:
+          MANGA_DESTINATION: "${{ inputs.destination }}"
         run: |
           set -euo pipefail
-          dest="${{ inputs.destination }}"
+          dest="${MANGA_DESTINATION}"
           case "$dest" in
             *[Ee]xport*|*[Ss]hared*|*[Rr]elease*|*[Pp]ublish*)
               echo "::error::红线：jmcomic（灰色来源）的落点不得是共享区或发布区：$dest"
@@ -214,54 +239,71 @@ jobs:
         env:
           JM_USERNAME: "${{ secrets.JM_USERNAME }}"
           JM_PASSWORD: "${{ secrets.JM_PASSWORD }}"
+          MANGA_IDS: "${{ inputs.ids }}"
+          MANGA_MODE: "${{ inputs.mode }}"
+          MANGA_DRY_RUN: "${{ inputs.dry_run }}"
         run: |
           set -euo pipefail
           # ⚠ 灰色来源：产物只落在本次运行的临时目录，**本 workflow 不上传它**
           dest=".work/raw-jmcomic"
           mkdir -p "$dest"
-          ids=$(echo "${{ inputs.ids }}" | tr ',' ' ')
+          read -r -a id_list <<< "$(printf '%s' "${MANGA_IDS}" | tr ',' ' ')"
           apply_flag=""
-          if [ "${{ inputs.dry_run }}" != "true" ]; then apply_flag="--apply"; fi
+          if [ "${MANGA_DRY_RUN}" != "true" ]; then apply_flag="--apply"; fi
           photo_flag=""
-          if [ "${{ inputs.mode }}" = "photo" ]; then photo_flag="--photo"; fi
-          manga download $ids --dest "$dest" $photo_flag $apply_flag \\
+          if [ "${MANGA_MODE}" = "photo" ]; then photo_flag="--photo"; fi
+          manga download "${id_list[@]}" --dest "$dest" $photo_flag $apply_flag \\
             --library-root "${MANGA_LIBRARY_ROOT:-$PWD/Library}"
 
       - name: 下载（gallery-dl）
         if: inputs.source == 'gallery-dl'
         shell: bash
+        env:
+          MANGA_IDS: "${{ inputs.ids }}"
+          MANGA_DRY_RUN: "${{ inputs.dry_run }}"
+          MANGA_DESTINATION: "${{ inputs.destination }}"
         run: |
           set -euo pipefail
-          ids=$(echo "${{ inputs.ids }}" | tr ',' ' ')
+          read -r -a url_list <<< "$(printf '%s' "${MANGA_IDS}" | tr ',' ' ')"
           apply_flag=""
-          if [ "${{ inputs.dry_run }}" != "true" ]; then apply_flag="--apply"; fi
+          if [ "${MANGA_DRY_RUN}" != "true" ]; then apply_flag="--apply"; fi
           # format 目前只有 cbz 真的实现了（gallery-dl --cbz）；其余值经环境变量 MANGA_FORMAT 预留
-          manga gallery-dl $ids --dest "${{ inputs.destination }}" $apply_flag
+          manga gallery-dl "${url_list[@]}" --dest "${MANGA_DESTINATION}" $apply_flag
 
       - name: 下载（mangadex）
         if: inputs.source == 'mangadex'
         shell: bash
+        env:
+          MANGA_IDS: "${{ inputs.ids }}"
+          MANGA_DRY_RUN: "${{ inputs.dry_run }}"
+          MANGA_LANGUAGE: "${{ inputs.language }}"
+          MANGA_DESTINATION: "${{ inputs.destination }}"
         run: |
           set -euo pipefail
-          ids=$(echo "${{ inputs.ids }}" | tr ',' ' ')
+          read -r -a url_list <<< "$(printf '%s' "${MANGA_IDS}" | tr ',' ' ')"
           apply_flag=""
-          if [ "${{ inputs.dry_run }}" != "true" ]; then apply_flag="--apply"; fi
-          lang_flag=""
-          if [ -n "${{ inputs.language }}" ]; then lang_flag="--language ${{ inputs.language }}"; fi
-          manga mangadex-dl $ids --dest "${{ inputs.destination }}" $apply_flag $lang_flag
+          if [ "${MANGA_DRY_RUN}" != "true" ]; then apply_flag="--apply"; fi
+          lang_flag=()
+          if [ -n "${MANGA_LANGUAGE:-}" ]; then lang_flag=(--language "${MANGA_LANGUAGE}"); fi
+          manga mangadex-dl "${url_list[@]}" --dest "${MANGA_DESTINATION}" $apply_flag "${lang_flag[@]}"
 
       - name: 入库 + 校验（闸门）
         if: inputs.dry_run == false
         shell: bash
+        env:
+          MANGA_COMICINFO: "${{ inputs.include_comicinfo }}"
+          MANGA_MIN_PAGES: "${{ inputs.min_pages }}"
         run: |
           set -euo pipefail
-          comicinfo_flag=""
-          if [ "${{ inputs.include_comicinfo }}" = "true" ]; then comicinfo_flag="--generate-comicinfo"; fi
-          manga ingest --apply $comicinfo_flag --library-root "${MANGA_LIBRARY_ROOT:-$PWD/Library}"
-          manga verify --min-pages "${{ inputs.min_pages }}" --library-root "${MANGA_LIBRARY_ROOT:-$PWD/Library}"
+          comicinfo_flag=()
+          if [ "${MANGA_COMICINFO}" = "true" ]; then comicinfo_flag=(--generate-comicinfo); fi
+          manga ingest --apply "${comicinfo_flag[@]}" --library-root "${MANGA_LIBRARY_ROOT:-$PWD/Library}"
+          manga verify --min-pages "${MANGA_MIN_PAGES}" --library-root "${MANGA_LIBRARY_ROOT:-$PWD/Library}"
 
-      - name: 上传产物（非灰色来源）
-        if: inputs.source != 'jmcomic'
+      - name: 上传产物（非灰色来源 · 非干跑）
+        # ⚠ 干跑没有产物 → 配合 if-no-files-found: error 会让 workflow 直接失败，
+        #   所以必须同时排除 dry_run。
+        if: inputs.source != 'jmcomic' && inputs.dry_run == false
         uses: actions/upload-artifact@v4
         with:
           name: "manga-${{ inputs.source }}-${{ github.run_id }}"
@@ -544,7 +586,10 @@ def validate_workflow(
     4. 若声明了 ``workflow_dispatch.inputs``，则**恰好**是那 10 个
        （``expected_inputs`` 可覆盖；``require_inputs=True`` 时强制必须声明）；
     5. 每个 input 都有 ``description`` / ``required`` / ``default`` / ``type``；
-    6. ``jobs`` 存在，每个 job 有 ``runs-on`` 与非空 ``steps``，每个 step 有 ``uses`` 或 ``run``。
+    6. ``jobs`` 存在，每个 job 有 ``runs-on`` 与非空 ``steps``，每个 step 有 ``uses`` 或 ``run``；
+    7. **``run:`` 块里不得出现 ``${{ inputs.* }}``** —— 那是脚本注入漏洞
+       （用户可填的自由文本被 bash 当代码执行）。所有 inputs 必须先经
+       ``env:`` 传进环境变量，``run:`` 里只引用 ``$VAR``。
 
     返回::
 
@@ -640,6 +685,15 @@ def validate_workflow(
                     continue
                 if "uses" not in step and "run" not in step:
                     errors.append(f"job {job_name} 的第 {index} 个 step 既没有 uses 也没有 run")
+                # 脚本注入：${{ inputs.* }} 绝不能出现在 run: 里。
+                # 用户可填的自由文本被 bash 当代码执行 = 任意命令执行。
+                run_block = str(step.get("run", ""))
+                if "${{ inputs." in run_block:
+                    errors.append(
+                        f"job {job_name} 的第 {index} 个 step 的 run: 里出现了 "
+                        "${{ inputs.* }} —— 脚本注入风险："
+                        "inputs 必须先经 env: 传进环境变量，run: 里只引用 $VAR"
+                    )
 
     result["ok"] = not errors
     return result

@@ -175,6 +175,13 @@ encrypt:
 
 `type` 与 `password` 二选一，必填其一。
 
+> ⚠ **本项目的红线（P0）**：灰色来源一律**不用**上游的 zip 加密插件 ——
+> 它的加密路径把 `-p<密码>` 拼进 `subprocess.run(shell=True)` 的命令串，
+> 并把命令写进日志 → **密码进 stderr / 日志 / 进程命令行**。
+> `manga favorites --zip` 改为**进程内**用 pyzipper 打 AES-256 加密包，
+> 密码只在内存里，不进任何命令行与日志。
+> 产物是 **AES 加密 zip**（不是传统 ZipCrypto），用 7-Zip / WinRAR 都能解。
+
 ### 自定义插件
 
 ```python
