@@ -18,6 +18,7 @@ import importlib.util
 import os
 import re
 import shutil
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -283,6 +284,10 @@ def working_directory(path: Path) -> Iterator[Path | None]:
     **目录不可写时不失败**：沙箱或只读环境下建目录会抛 ``PermissionError``，
     那不该让整条下载命令挂掉 —— 退回当前目录，由调用方给一条 warning。
     产出 ``None`` 表示「没能切目录」。
+
+    ⚠ **必须探写权限，不能只看目录建不建得出来**：Windows 上目录 ACL 可以
+    允许进入、却禁止新建文件。只 mkdir + chdir 的话，日志会被**静默丢弃**
+    （jmcomic 写不动就跳过），排查时什么都看不到。
     """
     previous = Path.cwd()
     try:
@@ -296,6 +301,20 @@ def working_directory(path: Path) -> Iterator[Path | None]:
     except OSError:
         yield None
         return
+
+    # 写权限探针：建一个唯一名字的文件再删掉。
+    probe = Path(path) / f".writable-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        probe.write_text("x", encoding="utf-8")
+    except OSError:
+        os.chdir(previous)
+        yield None
+        return
+    finally:
+        try:
+            probe.unlink()
+        except OSError:  # pragma: no cover - 已经被别人删了
+            pass
 
     try:
         yield Path(path)

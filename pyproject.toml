@@ -1,6 +1,6 @@
 [project]
 name = "manga-collector"
-version = "0.1.0"
+version = "0.3.0"
 description = "漫画采集聚合层：Agent Skill + 薄 CLI（Skill 是界面，CLI 是手，agent 是大脑）"
 readme = "README.md"
 requires-python = ">=3.14"

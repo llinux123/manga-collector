@@ -174,6 +174,35 @@ class TestWorkingDirectory:
         assert not (workdir / "jmcomic-download.log").exists()
         assert os.getcwd() != str(target)
 
+    def test_read_only_directory_is_detected(self, workdir: Path, monkeypatch) -> None:
+        """目录能进但**不能写**时不能当成可用 —— 那样日志会静默丢失。
+
+        只 mkdir + chdir 是不够的：Windows 上目录 ACL 可以允许进入、禁止新建文件。
+        """
+        target = workdir / "readonly"
+        target.mkdir()
+
+        real_write_text = Path.write_text
+
+        def fake_write_text(self, *args, **kwargs):
+            if self.parent == target:
+                raise PermissionError(13, "Permission denied")
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", fake_write_text)
+        before = Path.cwd()
+        with runtime.working_directory(target) as used:
+            assert used is None, "写不进去的目录不该被当成可用日志目录"
+        assert Path.cwd() == before
+
+    def test_probe_file_is_cleaned_up(self, workdir: Path) -> None:
+        """写权限探针文件用完要删掉 —— 不能在书库里留垃圾。"""
+        target = workdir / "logs"
+        with runtime.working_directory(target):
+            pass
+        leftovers = [p.name for p in target.iterdir()]
+        assert leftovers == [], f"探针文件没清干净：{leftovers}"
+
 
 class TestJmLogRouting:
     def test_jmcomic_logs_go_to_stderr(self) -> None:

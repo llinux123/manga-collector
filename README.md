@@ -165,6 +165,8 @@ Copy-Item -Recurse .agents\skills\manga "$env:USERPROFILE\.agents\skills\manga"
 | **P2** | 参考表补齐与校准（21 个插件 kwargs / DirRule 变量 / 证据等级标注） | ✅ 已完成 |
 | **P3** | gallery-dl / mangadex-downloader 适配器 + 长任务模型 + GitHub Actions 生成器 | ✅ 已完成 |
 | **P4** | 加固（日志治理、依赖探测、优雅停机）、测试、装配与发布 | ✅ 已完成 |
+| **P5** | 透传架构（`--option` / `--config` / `-o` / `--`）+ 搜索分类排行榜 + 优雅取消 | ✅ 已提交 |
+| **P6** | 稳定性审计修复：假成功防护、取消与终态诚实、用法错误入信封、版本单一来源、打包带配置、Actions 注入修复、CI | ✅ 已完成 |
 
 ### P2 当前进度
 

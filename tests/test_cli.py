@@ -37,6 +37,46 @@ class TestEnvelopeContract:
         assert paths["library"].endswith("Manga\\Library")
 
 
+class TestUsageErrorsAreEnvelopes:
+    """参数写错也必须给 JSON 信封（退出码 1）—— agent 只认一种形状。
+
+    之前：Typer/Click 的用法错误直接打印 Rich 面板到 stderr、退出码 2、
+    stdout 一个字都没有。agent 拿到空输出 + 退出码 2，既不知道是「用法错」
+    还是「执行错」，也没法从 stdout 解析错误码。
+    """
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ("download",),                    # 缺必填参数
+            ("search", "--mode", "bogus"),    # 未知子命令参数值
+            ("nosuchcommand",),               # 未知子命令
+            ("paths", "--no-such-flag"),       # 未知选项
+            ("export", "123", "--format"),     # 选项缺值
+        ],
+    )
+    def test_usage_error_is_json_envelope_with_exit_1(self, args: tuple[str, ...]) -> None:
+        result = runner.invoke(app, list(args))
+        assert result.exit_code == 1, f"{args} → 退出码应为 1（用法错），实际 {result.exit_code}"
+        payload = json.loads(result.stdout)
+        assert payload["ok"] is False
+        assert payload["exit"] == 1
+        assert payload["error"]["code"] == "BAD_USAGE"
+        assert payload["error"]["message"]
+
+    def test_stdout_contains_only_the_envelope(self) -> None:
+        """stdout 里不许混入 Typer 的帮助文本 / Rich 面板。"""
+        result = runner.invoke(app, ["download"])
+        payload = json.loads(result.stdout)  # 能整段解析就说明 stdout 只有信封
+        assert payload["error"]["code"] == "BAD_USAGE"
+
+    def test_help_still_works(self) -> None:
+        """--help 是给人看的，不该被包成错误信封。"""
+        result = runner.invoke(app, ["--help"])
+        assert result.exit_code == 0
+        assert "Usage" in result.stdout or "用法" in result.stdout
+
+
 class TestVerify:
     def test_clean_library_passes(self, library_root: Path, scripts_dir: Path) -> None:
         code, env = _invoke(

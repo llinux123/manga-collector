@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from typer.exceptions import Abort
 
 from . import __version__
 from . import actions_gen
@@ -59,7 +60,113 @@ app = typer.Typer(
     help="漫画采集聚合层 · 薄 CLI（Skill 是界面，CLI 是手，agent 是大脑）",
     no_args_is_help=True,
     add_completion=False,
+    # 参数写错时不要打 Rich 异常面板 —— 我们要的是 JSON 信封（见 _MangaGroup）
+    pretty_exceptions_enable=False,
 )
+
+
+# ── 用法错误 → JSON 信封（P1） ──────────────────────────────────────────────
+#
+# Typer/Click 的用法错误（缺参数 / 未知选项 / 未知子命令）默认：
+#   * 往 **stderr** 打 Rich 面板（人类可读）；
+#   * **stdout 一个字都没有**；
+#   * 退出码 **2**（= 本项目的「执行错误」）。
+#
+# 这对 agent 是灾难：stdout 空 → 没法解析错误码；退出码 2 → 分不清
+# 「参数写错了」还是「真出错了」。契约要求 stdout 永远只有一个 JSON 信封，
+# 所以这里把用法错误统一翻译成 ``BAD_USAGE``（退出码 1）。
+#
+# 实现方式：自定义 Group，用 ``standalone_mode=False`` 调 Typer 的内部入口 ——
+# Click 在 standalone 模式下会**自己**吞掉 UsageError 并 ``sys.exit(2)``，
+# 只有非 standalone 模式才会把异常抛给调用方，我们才有翻译的机会。
+
+
+def _usage_envelope(message: str, *, hint: str | None = None) -> Envelope:
+    """用法错误 → 标准信封（退出码 1）。"""
+    return Envelope(
+        ok=False,
+        error={
+            "code": "BAD_USAGE",
+            "message": message,
+            "hint": hint,
+        },
+        exit=EXIT_USAGE,
+    )
+
+
+def _emit_usage_error(message: str, *, hint: str | None = None) -> int:
+    """把用法错误写成信封到 stdout，返回退出码 1。"""
+    env = _usage_envelope(message, hint=hint)
+    sys.stdout.write(env.to_json() + "\n")
+    sys.stdout.flush()
+    return EXIT_USAGE
+
+
+def _usage_hint(exc: Any) -> str | None:
+    """从 UsageError 里抠出用法说明（``Usage: manga download [OPTIONS] ...``）。"""
+    ctx = getattr(exc, "ctx", None)
+    if ctx is None:
+        return None
+    try:
+        return ctx.get_usage()
+    except Exception:  # noqa: BLE001 - 拿不到用法说明就算了
+        return None
+
+
+class _MangaGroup(typer.core.TyperGroup):
+    """把 Click 的用法错误翻译成 JSON 信封（退出码 1）。
+
+    ``--help`` 不受影响 —— 它走 ``ctx.exit()``，不是异常。
+    """
+
+    def main(  # noqa: D102 - 覆盖 Click 的入口
+        self,
+        args=None,  # noqa: ANN001
+        prog_name: str | None = None,
+        complete_var: str | None = None,
+        standalone_mode: bool = True,
+        windows_expand_args: bool = True,
+        **extra,
+    ):
+        from typer import _click
+        from typer.core import _main
+
+        try:
+            result = _main(
+                self,
+                args=args,
+                prog_name=prog_name,
+                complete_var=complete_var,
+                standalone_mode=False,
+                windows_expand_args=windows_expand_args,
+                rich_markup_mode=self.rich_markup_mode,
+                **extra,
+            )
+        except _click.exceptions.NoArgsIsHelpError as exc:
+            # 一个子命令都没给：打印用法说明（作为 hint），退出码 1
+            raise SystemExit(
+                _emit_usage_error("缺少子命令", hint=_usage_hint(exc))
+            ) from exc
+        except _click.exceptions.UsageError as exc:
+            message = exc.format_message() if hasattr(exc, "format_message") else str(exc)
+            raise SystemExit(
+                _emit_usage_error(message, hint=_usage_hint(exc))
+            ) from exc
+        except _click.exceptions.ClickException as exc:
+            message = exc.format_message() if hasattr(exc, "format_message") else str(exc)
+            raise SystemExit(_emit_usage_error(message)) from exc
+        except Abort:
+            raise SystemExit(
+                _emit_usage_error("命令被中断（Ctrl+C）")
+            ) from None
+
+        if isinstance(result, int):
+            raise SystemExit(result)
+        return result
+
+
+# 用法错误的信封走完之后，再把 Group 换上去（类必须在 app 创建前定义好）
+app.info.cls = _MangaGroup
 
 # ── 公共选项 ──────────────────────────────────────────────────────────────
 

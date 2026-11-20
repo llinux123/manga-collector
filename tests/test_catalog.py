@@ -73,6 +73,39 @@ class TestScanAndLookup:
         assert data["by"] == "album_id"
 
 
+class TestSourcePrefixDoesNotBreakTitleLookup:
+    """库是「来源名/书名」两层结构 —— 标题兜底不能把来源名算进书名。
+
+    之前 ``title_norm`` 取的是**相对库根的整条路径**
+    （``禁漫 (JMComic)\\My Work`` → ``禁漫jmcomicmywork``），
+    于是 ``manga lookup --title "My Work"`` 永远匹配不上 —— 明明在库里。
+    """
+
+    def _nested_lib(self, workdir: Path) -> Path:
+        lib = workdir / "Library" / "Manga" / "Library"
+        make_cbz(
+            lib / "禁漫 (JMComic)" / "My Work" / "001 - A.cbz",
+            series="My Work",
+            notes="jm:404005",
+        )
+        return lib
+
+    def test_title_norm_uses_leaf_directory_name(self, workdir: Path) -> None:
+        index = catalog.scan_library(self._nested_lib(workdir))
+        row = index["series"][0]
+        assert row["title_norm"] == catalog.normalize_title("My Work")
+
+    def test_lookup_by_title_finds_nested_series(self, workdir: Path) -> None:
+        data = catalog.lookup(self._nested_lib(workdir), title="My Work")
+        assert data["in_library"] is True
+        assert data["by"] == "title"
+
+    def test_series_field_keeps_the_full_relative_path(self, workdir: Path) -> None:
+        """``series`` 仍给完整相对路径（人能看懂书在哪个来源下）。"""
+        index = catalog.scan_library(self._nested_lib(workdir))
+        assert index["series"][0]["series"] == "禁漫 (JMComic)\\My Work"
+
+
 class TestLookupCli:
     def test_cli_lookup_by_id(self, workdir: Path) -> None:
         lib = _lib(workdir)

@@ -137,7 +137,11 @@ def scan_library(library: Path) -> dict[str, Any]:
             "dir": str(directory),
             "cbz_count": len(cbz_files),
             "album_id": album_id,
-            "title_norm": normalize_title(series_name),
+            # 标题归一化只取**叶子目录名**（书名）——
+            # 库是「来源名/书名」两层结构（``禁漫 (JMComic)\\My Work``），
+            # 拿整条路径归一化会把来源名也算进去（→ ``禁漫jmcomicmywork``），
+            # 于是 ``lookup --title "My Work"`` 永远匹配不上明明在库的书。
+            "title_norm": normalize_title(directory.name),
         }
         series_rows.append(row)
         if album_id and album_id not in by_id:
@@ -166,7 +170,9 @@ def _title_match(series_rows: list[dict[str, Any]], title: str) -> dict[str, Any
     ]
     if not candidates:
         return None
-    return max(candidates, key=lambda r: len(r["series"]))
+    # 比**归一化标题**的长度，不是路径长度 —— 路径长只说明来源层深，
+    # 与标题匹配质量无关（否则「来源名很长」的书会永远赢）。
+    return max(candidates, key=lambda r: len(r["title_norm"]))
 
 
 def _public(row: dict[str, Any] | None) -> dict[str, Any] | None:

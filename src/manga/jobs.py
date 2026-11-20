@@ -35,6 +35,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -158,9 +159,17 @@ class JobStore:
         for candidate in candidates:
             try:
                 candidate.mkdir(parents=True, exist_ok=True)
-                probe = candidate / ".writable"
-                probe.write_text("x", encoding="utf-8")
-                probe.unlink()
+                # 探针文件名必须**唯一**：并发创建作业目录时，固定名字会让
+                # 两个进程「一个写、一个删」→ 后者 unlink 报 FileNotFoundError
+                # → 整个目录被判成不可写。
+                probe = candidate / f".writable-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+                try:
+                    probe.write_text("x", encoding="utf-8")
+                finally:
+                    try:
+                        probe.unlink()
+                    except OSError:  # pragma: no cover - 已经被别人删了
+                        pass
                 return cls(candidate)
             except OSError:
                 continue
@@ -291,13 +300,31 @@ class JobStore:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    """原子写：先写临时文件再 replace，避免读到写了一半的 JSON。"""
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    """原子写：先写临时文件再 replace，避免读到写了一半的 JSON。
+
+    临时文件名带唯一后缀 —— 固定名（``state.json.tmp``）在并发写同一个文件时
+    会互相覆盖：两个写者用同一个临时名，A 写完 B 写，A 的 replace 把 B 的
+    内容搬上去了，或者 B 的 replace 找不到文件直接报错。
+    """
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:  # pragma: no cover - 已经被 replace 走了
+            pass
 
 
 # ── 进度协议（子进程侧） ──────────────────────────────────────────────────
+
+#: 进度写的进程内锁。
+#:
+#: 子进程是**多线程**的（逐 ID 下载，每个 ID 一个线程），而进度协议是
+#: 「读 → 改 → 写」三步 —— 两个线程同时读到同一份旧数据，后写的把先写的
+#: 条目覆盖掉 → 进度里少了已完成的 ID，agent 以为没下完，重复下载。
+_PROGRESS_LOCK = threading.Lock()
 
 
 def record_progress(
@@ -315,32 +342,33 @@ def record_progress(
     if not path_text:
         return False
     path = Path(path_text)
-    current: dict[str, Any] = {}
-    if path.is_file():
+    with _PROGRESS_LOCK:
+        current: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                current = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                current = {}
+
+        def merge(key: str, values: Iterable[str] | None) -> None:
+            if values is None:
+                return
+            merged = list(current.get(key, []))
+            for value in values:
+                if value not in merged:
+                    merged.append(value)
+            current[key] = merged
+
+        merge("items", items)
+        merge("done", done)
+        merge("failed", failed)
+        if message is not None:
+            current["message"] = message
+        current["updated_at"] = _now()
         try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            current = {}
-
-    def merge(key: str, values: Iterable[str] | None) -> None:
-        if values is None:
-            return
-        merged = list(current.get(key, []))
-        for value in values:
-            if value not in merged:
-                merged.append(value)
-        current[key] = merged
-
-    merge("items", items)
-    merge("done", done)
-    merge("failed", failed)
-    if message is not None:
-        current["message"] = message
-    current["updated_at"] = _now()
-    try:
-        _write_json(path, current)
-    except OSError:
-        return False
+            _write_json(path, current)
+        except OSError:
+            return False
     return True
 
 

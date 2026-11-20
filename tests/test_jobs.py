@@ -37,6 +37,34 @@ class TestJobStore:
         assert excinfo.value.exit_code == 4
         assert excinfo.value.code == "JOB_NOT_FOUND"
 
+    def test_write_probe_leaves_no_garbage(self, workdir: Path) -> None:
+        """写权限探针用完要删干净 —— 不能在书库里留垃圾文件。"""
+        root = workdir / "jobs"
+        jobs.JobStore.create([root])
+        leftovers = [p.name for p in root.iterdir()]
+        assert leftovers == [], f"探针文件没清干净：{leftovers}"
+
+    def test_write_probe_uses_a_unique_name(self, workdir: Path, monkeypatch) -> None:
+        """探针文件名必须唯一 —— 并发创建作业目录时会互相踩。
+
+        之前固定叫 ``.writable``：两个进程同时探测 → 一个写、一个删 →
+        后者 ``unlink`` 报 FileNotFoundError → 整个目录被判成不可写。
+        """
+        root = workdir / "jobs"
+        seen: list[str] = []
+        real_write_text = Path.write_text
+
+        def spy_write_text(self, *args, **kwargs):
+            if self.parent == root:
+                seen.append(self.name)
+            return real_write_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", spy_write_text)
+        jobs.JobStore.create([root])
+        jobs.JobStore.create([root])
+        assert len(seen) == 2
+        assert seen[0] != seen[1], "探针文件名必须每次不同"
+
 
 class TestProgressProtocol:
     def test_record_progress_is_noop_outside_a_job(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -64,6 +92,55 @@ class TestProgressProtocol:
         monkeypatch.setenv(jobs.ENV_JOB_PROGRESS, str(path))
         assert jobs.record_progress(done=["a"]) is True
         assert json.loads(path.read_text(encoding="utf-8"))["done"] == ["a"]
+
+    def test_concurrent_record_progress_keeps_all_items(
+        self, monkeypatch: pytest.MonkeyPatch, workdir: Path
+    ) -> None:
+        """并发写进度不能丢条目 —— 子进程是多线程的（逐 ID 下载）。
+
+        之前是「读 → 改 → 写」三步没有锁：两个线程同时读到同一份旧数据，
+        后写的把先写的条目**覆盖**掉 → 进度里少了已完成的 ID，
+        agent 以为没下完，重复下载。
+        """
+        import threading
+
+        path = workdir / "progress.json"
+        monkeypatch.setenv(jobs.ENV_JOB_PROGRESS, str(path))
+
+        def worker(index: int) -> None:
+            for _ in range(10):
+                jobs.record_progress(done=[f"item-{index}"])
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        for index in range(4):
+            assert f"item-{index}" in payload["done"], f"并发写丢了 item-{index}"
+
+    def test_temp_file_name_is_unique(self, workdir: Path) -> None:
+        """原子写的临时文件名必须唯一 —— 并发写同一个文件会互相覆盖。"""
+        target = workdir / "state.json"
+        names: list[str] = []
+        real_replace = Path.replace
+
+        def spy_replace(self, other):
+            names.append(self.name)
+            return real_replace(self, other)
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        original = Path.replace
+        Path.replace = spy_replace  # type: ignore[method-assign]
+        try:
+            jobs._write_json(target, {"a": 1})
+            jobs._write_json(target, {"a": 2})
+        finally:
+            Path.replace = original  # type: ignore[method-assign]
+        assert len(names) == 2
+        assert names[0] != names[1], "临时文件名必须每次不同"
 
 
 class TestLifecycle:
@@ -226,7 +303,9 @@ class TestCancelHonesty:
         # 关键：状态**不能**被写成 cancelled（进程还在跑）
         current = store.load(state.id)
         assert current.state != jobs.STATE_CANCELLED
-        assert store.read_final(state.id) is None
+        # 也不能自己写一份「已取消」的终态报告（子进程自己写的终态不算）
+        final = store.read_final(state.id)
+        assert final is None or final.get("state") != jobs.STATE_CANCELLED
 
     def test_ctrl_break_branch_confirms_the_process_died(
         self, monkeypatch: pytest.MonkeyPatch
