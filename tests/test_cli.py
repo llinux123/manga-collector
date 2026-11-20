@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from conftest import make_cbz
 from manga.cli import app
 
 runner = CliRunner()
@@ -69,6 +70,11 @@ class TestIngest:
         assert env["ok"] is True
         assert env["data"]["dry_run"] is True
         assert any("dry-run" in w for w in env["warnings"])
+        report = env["data"]["report"]
+        assert report["parsed"] is True
+        assert report["scanned"] == 1  # inbox 夹具放了 1 个 CBZ
+        assert report["planned_moves"] == 1
+        assert "moved" not in report  # dry-run 没有 apply-only 字段
 
         assert sorted(p.name for p in inbox.rglob("*") if p.is_file()) == before_inbox
         assert sorted(p.name for p in (library_root / "Manga" / "Library").rglob("*") if p.is_file()) == before_library
@@ -78,6 +84,137 @@ class TestIngest:
         before = sorted(p.name for p in export.rglob("*") if p.is_file())
         _invoke("ingest", "--library-root", str(library_root), "--scripts-dir", str(scripts_dir))
         assert sorted(p.name for p in export.rglob("*") if p.is_file()) == before
+
+
+class TestIngestAlbumId:
+    """入库时把车号写进 ComicInfo，并按车号判重。"""
+
+    def _read_comicinfo(self, cbz: Path) -> str:
+        import zipfile
+
+        with zipfile.ZipFile(cbz) as z:
+            return z.read("ComicInfo.xml").decode("utf-8", "replace")
+
+    def test_album_id_written_to_comicinfo(self, library_root: Path, scripts_dir: Path, inbox: Path) -> None:
+        import zipfile
+
+        series = inbox / "Album Series"
+        series.mkdir(parents=True, exist_ok=True)
+        # 真实链路：Convert 打出的 CBZ 里没有 ComicInfo，入库时才生成
+        with zipfile.ZipFile(series / "001 - X.cbz", "w", compression=zipfile.ZIP_STORED) as z:
+            z.writestr("001.jpg", b"x")
+        (series / ".jm-album.json").write_text(
+            json.dumps({"album_id": "404005", "source": "jmcomic"}, ensure_ascii=False), encoding="utf-8"
+        )
+
+        code, env = _invoke(
+            "ingest",
+            "--library-root",
+            str(library_root),
+            "--scripts-dir",
+            str(scripts_dir),
+            "--generate-comicinfo",
+            "--apply",
+        )
+        assert code == 0, env
+        target = library_root / "Manga" / "Library" / "Album Series" / "001 - X.cbz"
+        assert target.is_file()
+        ci = self._read_comicinfo(target)
+        assert "jm:404005" in ci
+        assert "https://18comic.vip/album/404005/" in ci
+        report = env["data"]["report"]
+        assert report["scanned"] == 2  # inbox 夹具 1 个 + 本用例造的 1 个
+        assert report["moved"] == 2
+        assert report["comicinfo_written"] == 1  # 夹具包已有 ComicInfo，只有新包需要生成
+        assert report["errors"] == 0
+
+    def test_duplicate_album_id_is_skipped(self, library_root: Path, scripts_dir: Path) -> None:
+        # 库里已有一个车号 404005 的系列
+        make_cbz(
+            library_root / "Manga" / "Library" / "Existing Work" / "001 - A.cbz",
+            series="Existing Work",
+            notes="jm:404005",
+        )
+        # 收件箱里换了个书名、但同一车号 → 应判重跳过
+        another = library_root / "00-Incoming" / "Manga" / "Another Work"
+        make_cbz(another / "001 - B.cbz", series="Another Work")
+        (another / ".jm-album.json").write_text(
+            json.dumps({"album_id": "404005"}, ensure_ascii=False), encoding="utf-8"
+        )
+
+        code, env = _invoke(
+            "ingest",
+            "--library-root",
+            str(library_root),
+            "--scripts-dir",
+            str(scripts_dir),
+            "--generate-comicinfo",
+            "--apply",
+        )
+        assert code == 0, env
+        assert not (library_root / "Manga" / "Library" / "Another Work").exists()
+        assert any("退出码 1" in w or "冲突" in w for w in env["warnings"])
+        assert env["data"]["report"]["conflicts"] == 1
+
+
+class TestConvertCbzAlbumId:
+    def test_sidecar_copied_to_inbox(self, library_root: Path, scripts_dir: Path) -> None:
+        raw = library_root / "00-Incoming" / "_raw_jmcomic"
+        album = raw / "Some Album"
+        chapter = album / "第1话"
+        chapter.mkdir(parents=True)
+        (chapter / "001.jpg").write_bytes(b"x")
+        (chapter / "002.jpg").write_bytes(b"y")
+        (album / ".jm-album.json").write_text(
+            json.dumps({"album_id": "777", "source": "jmcomic"}, ensure_ascii=False), encoding="utf-8"
+        )
+
+        code, env = _invoke(
+            "convert-cbz",
+            "--library-root",
+            str(library_root),
+            "--scripts-dir",
+            str(scripts_dir),
+            "--source-root",
+            str(raw),
+            "--target-root",
+            str(library_root / "00-Incoming" / "Manga"),
+            "--apply",
+        )
+        assert code == 0, env
+        target_series = library_root / "00-Incoming" / "Manga" / "禁漫 (JMComic)" / "Some Album"
+        assert (target_series / ".jm-album.json").is_file()
+        assert list(target_series.glob("*.cbz"))
+
+        # 信封自带结构化报告：agent 不必再列目录核对产物数量
+        report = env["data"]["report"]
+        assert report["parsed"] is True
+        assert report["planned_or_succeeded"] == 1
+        assert report["skipped"] == 0
+        assert report["errors"] == 0
+        assert report["packed"] == [
+            {"series": "Some Album", "file": "001.cbz", "images": 2, "source": "第1话"}
+        ]
+        assert isinstance(env["data"]["elapsed_s"], (int, float))
+
+    def test_empty_source_reports_nothing_to_do(self, library_root: Path, scripts_dir: Path) -> None:
+        raw = library_root / "00-Incoming" / "_raw_jmcomic"
+        raw.mkdir(parents=True, exist_ok=True)
+        code, env = _invoke(
+            "convert-cbz",
+            "--library-root",
+            str(library_root),
+            "--scripts-dir",
+            str(scripts_dir),
+            "--source-root",
+            str(raw),
+            "--target-root",
+            str(library_root / "00-Incoming" / "Manga"),
+            "--apply",
+        )
+        assert code == 0, env
+        assert env["data"]["report"]["nothing_to_do"] is True
+        assert any("nothing_to_do" in w for w in env["warnings"])
 
 
 class TestGuard:

@@ -53,6 +53,8 @@
   <Manga>Yes</Manga>
   <LanguageISO>zh-CN</LanguageISO>
   <PageCount>42</PageCount>
+  <Notes>jm:404005</Notes>          <!-- 车号：机器可解析的权威标识（jm:<album_id>） -->
+  <Web>https://18comic.vip/album/404005/</Web>
   <Summary>简介</Summary>
   <Genre>分类</Genre>
   <Tags>标签1,标签2</Tags>
@@ -68,6 +70,8 @@
 | `Manga` | **不校验**（是阅读端的事） | **Komga 只认 `YesAndRightToLeft` 才 RTL**，写 `Yes` 不生效 |
 | `PageCount` | **不校验** | 缺省时服务端可能算错 |
 | `LanguageISO` | **不校验**；入库脚本按路径前缀推断，没命中就留空 | 空值会让阅读端的多语言筛选失效 |
+| `Notes` | **不校验**；**车号权威标识**：`jm:<album_id>`（下载时由 `.jm-album.json` sidecar 带进来，入库写入） | 判断「是否在库」优先按它；缺失则退回标题匹配 |
+| `Web` | **不校验**；写 `https://18comic.vip/album/<album_id>/`，方便阅读端点开 | 域名会变，判重不要只依赖 Web，Notes 才是权威 |
 
 **服务端映射**：Komga 的 `Series` 取各书**最常见值**、`Publisher`/`Genre`/`LanguageISO` 同理；
 Kavita 把 `Number`→章号、`Volume`→卷、`Count`→完结状态、`Format`→Special、`SeriesGroup`→Collection、`StoryArc`→Reading List。

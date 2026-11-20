@@ -7,7 +7,7 @@ description: >
   或要把下载件变成一话一包 + ComicInfo.xml 的收藏库；或要检查漫画库质量。
   不做：不装第三方扩展；不替用户索要密码或 Cookie；不把灰色来源导出到手机同步区；
   不做 OCR/翻译/超分（另有独立 skill）。
-version: 0.3.0
+version: 0.4.0
 metadata:
   project: manga
   repo: https://github.com/hect0x7/JMComic-Crawler-Python
@@ -28,9 +28,10 @@ CLI 把所有确定性动作（跑脚本、解析退出码、守红线）做掉�
 
 | 用户说 | 你做什么 |
 |---|---|
-| 「下载 JM 404005」 | `manga doctor` 确认环境 → `manga download 404005`（**dry-run**，报章节数/图片数）→ 用户确认 → `manga download 404005 --apply` → §7 的入库三步 |
+| 「下载 JM 404005」 | `manga doctor` 确认环境 → `manga download 404005 --dest .manga-tmp\raw`（**dry-run**，报章节数/图片数）→ 用户确认 → `manga job start download 404005 --dest .manga-tmp\raw --apply` → §7 的暂存入库流程 |
 | 「搜个本子 / 找 XX 的图」 | `manga search "关键词" --mode site\|tag\|author\|work\|actor` |
 | 「这本是啥 / 有几话」 | `manga album 404005` |
+| 「这本在不在库 / 下过没」 | `manga lookup 404005`（按车号精确判，`--title` 兜底；只读本地库） |
 | 「看看评论区」 | `manga comments 404005` |
 | 「导出成 zip / pdf / 长图」 | `manga export 404005 --format zip\|pdf\|longimg`（落点受红线约束） |
 | 「把这个本子入库」 | `manga convert-cbz --apply` → `manga ingest --apply` → `manga verify` |
@@ -53,6 +54,7 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 | `manga doctor` | 环境体检：PowerShell、脚本、jmcomic（**导入 + 版本下限**）、**登录态**、**可选依赖**、代理端口、目录、工作区 | 否 |
 | `manga search` | 禁漫搜索（site/tag/author/work/actor 五维）+ 分类浏览 + 排行榜 | 否 |
 | `manga album` | 本子详情（含章节列表） | 否 |
+| `manga lookup` | 判断一本是否**已在库中**：`manga lookup <车号>`（`--title` 兜底）。车号来自 ComicInfo 的 `Notes: jm:<id>` | 否 |
 | `manga comments` | 本子评论（含回评树） | 否 |
 | `manga domains` | 当前域名池（API 静态池 + 网页端域名） | 否 |
 | `manga pick-domain` | 并发探测域名池，列出最快的可用域名 | 否 |
@@ -81,6 +83,11 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
 `--scripts-dir`（脚本目录）、`--report-path`（校验报告 CSV）、`--top-n`（问题条数）、
 `--dest`（下载/导出落点，默认 `00-Incoming\_raw_jmcomic`）、`--impl api|html`。
 
+**车号（album id）链路**：`manga download --apply` 成功后会在每本目录写 `.jm-album.json`；
+`manga convert-cbz` 把它带进收件箱的系列目录；`manga ingest --generate-comicinfo` 再写进
+CBZ 的 `ComicInfo.xml`（`<Notes>jm:<id></Notes>` + `<Web>https://18comic.vip/album/<id>/</Web>`）。
+`manga lookup <id>` 与入库时的重复判重都以这个车号为准，标题匹配只作兜底。
+
 **落点红线**：`manga download` / `manga export` 的落点若落在
 `Export\Manga`（共享区）或 `Manga\Library`（权威库）→ **退出码 6**，这是代码强制的，改参数绕不过去。
 透传参数（`--option` / `--config` / `-o` / `--`）里的路径也会被扫 —— 指向红线目录一样拒。
@@ -102,7 +109,6 @@ CLI 位置：本仓库的 `.venv/Scripts/manga.exe`（或 `python -m manga`）�
    `manga gallery-dl` 直接套用；要上游原生命名就显式 `--config <file>`。
 2. **退出码位 4 = 部分文件下载失败** —— 产物 CBZ 已写出但少了几页 → 报
    `PARTIAL_DOWNLOAD`（退出码 2），**不是**成功。**重跑同一条命令即可续传**。
-
 
 ## 3. 输出契约（必须遵守）
 
@@ -162,9 +168,35 @@ mangadex-dl --save-as cbz --path "$env:USERPROFILE\Documents\Library\00-Incoming
 下载完成后回到 §1 的「入库」三步。
 
 > 禁漫走 `manga download`，落点是 `00-Incoming\_raw_jmcomic`（**不是** `00-Incoming\Manga`）——
-> 散图先在暂存区，打包成 CBZ 后才进收件箱。
+> 散图先在暂存区，打包成 CBZ 后才进收件箱。沙箱会话里这些落点全部换成 `.manga-tmp\`（见 §7）。
 
-## 7. 写操作确认
+## 7. 落点策略：工作区暂存优先（沙箱友好）
+
+**默认落点（`%USERPROFILE%\Documents\Library\00-Incoming\*`）在 DSH 会话工作区之外。**
+沙箱（workspace-write）模式下每一次写都要弹授权；更糟的是**被拒时可能静默失败**
+（作业报成功、实际 0 个文件）。所以默认流程是：
+
+**下载与打包一律落在本仓库的 `.manga-tmp\` 暂存区，只有最后的入库才碰书库。**
+
+| 步骤 | 命令 | 写哪 | 要授权吗 |
+|---|---|---|---|
+| 1. 下载散图 | `manga job start download <id> --dest .manga-tmp\raw --apply` | 工作区内 | 否 |
+| 2. 打包 CBZ | `manga convert-cbz --source-root .manga-tmp\raw --target-root .manga-tmp\cbz --apply` | 工作区内 | 否 |
+| 3. 入库 | `manga ingest --inbox-root .manga-tmp\cbz --generate-comicinfo --zero-pad --apply` | 权威库 | **仅此一步** |
+| 4. 验收 | `manga verify --series <名>` | 只读 | 否 |
+
+规矩：
+
+- `.manga-tmp\` 已被 `.gitignore` 覆盖（`.manga-tmp*/`），不会进版本库；它不是共享区，
+  暂存灰色产物不碰红线（红线只挡 `Export\Manga` 与 `Manga\Library`，代码强制，见 §2 落点红线）。
+- **落盘必核对**：`convert-cbz` / `ingest` 的 `--apply` 之后看信封 `data.report`——
+  `nothing_to_do: true` 或 `errors > 0` 都**不要**当作成功继续；
+  `planned_or_succeeded` 为 0 时列一次落点目录排查（写被拦时信封仍可能 `ok: true`）。
+  只有 `report.parsed: false`（旧版工作区脚本没被认出）才回退到旧做法：列目录确认产物数量 > 0。
+- 入库并验收通过后，清掉 `.manga-tmp\` 里对应的散图与 CBZ（要留档重跑也行，磁盘够就留）。
+- 需要用户确认的仍然只有 §8 的 dry-run → `--apply` 环节；暂存区内的 dry-run 随便跑。
+
+## 8. 写操作确认
 
 `download` / `ingest` / `convert-cbz` **默认 dry-run**。流程固定：
 
@@ -174,7 +206,7 @@ mangadex-dl --save-as cbz --path "$env:USERPROFILE\Documents\Library\00-Incoming
 
 **不要**在用户没确认时直接 `--apply`。**不要**为了「让它过校验」而删文件或改元数据——校验器是闸门，不是待修的 bug。
 
-## 8. 进度与长任务
+## 9. 进度与长任务
 
 **下载大本子可能跑几分钟到几十分钟 —— 别用一条同步命令死等。** 用作业模型：
 
@@ -197,7 +229,8 @@ manga job cancel <job_id>                            # 真能停：给已完成 
 1. 一次确认整本 / 整批，**不要**一章一话地问用户；
 2. `job start` 之后**只 poll 2~3 次**（每次间隔 ≥ 15 秒），不要 sleep 式轮询；
 3. 拿到终态就 `job result` 一次拿全，**不要**再去翻日志；
-4. 需要入库时：`convert-cbz` → `ingest` → `verify --series <名>`，**每步一次调用**。
+4. 需要入库时：`convert-cbz --source-root .manga-tmp\raw --target-root .manga-tmp\cbz --apply` →
+   `ingest --inbox-root .manga-tmp\cbz --apply` → `verify --series <名>`，**每步一次调用**（§7）。
 
 **作业取消是协作式的**：`job cancel` 只写一个取消标记，**子进程自己**看到后退出
 （受限环境里外部杀「别的进程创建出来的进程」常被拒 —— 沙箱、容器、CI 都这样）。
@@ -216,7 +249,7 @@ manga job cancel <job_id>                            # 真能停：给已完成 
 - 作业目录：`<书库根>\Manga\Metadata\jobs\<job_id>\`（`state.json` / `progress.json` /
   `final.json` / `envelope.json` / `error.log`）。书库不可写时自动退到系统临时目录。
 
-## 9. 参考资料（按需读，别一次全读）
+## 10. 参考资料（按需读，别一次全读）
 
 | 什么时候读 | 哪一篇 |
 |---|---|
@@ -232,7 +265,7 @@ manga job cancel <job_id>                            # 真能停：给已完成 
 > 【文档】级的（html 端、收藏夹、签到、异步）**本机没验过**，用之前先小规模试。
 > 上游 jmcomic 升级后，用 `uv run python tools/jmcomic_facts.py check` 查 references 是否过期。
 
-## 10. 红线之外的硬规则
+## 11. 红线之外的硬规则
 
 - **不索要、不输出、不复制**用户的密码 / Cookie / 授权码。
 - **不自动更新**依赖、不自动 `pip install`。

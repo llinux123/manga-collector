@@ -34,6 +34,11 @@ ENV_WORKSPACE = "MANGA_WORKSPACE"
 ENV_OPTION_FILE = "MANGA_OPTION_FILE"
 #: gallery-dl 配置文件（覆盖默认的「入库合规命名」模板）
 ENV_GALLERY_DL_CONFIG = "MANGA_GALLERY_DL_CONFIG"
+#: 来源层目录名（如「禁漫 (JMComic)」）—— 库内「来源名/书名」两层结构的来源名
+ENV_SOURCE_PREFIX = "MANGA_SOURCE_PREFIX"
+
+#: 默认来源层：禁漫（灰色来源，产物只进权威库，绝不进共享区）
+DEFAULT_SOURCE_PREFIX = "禁漫 (JMComic)"
 
 #: 本机默认书库根目录
 DEFAULT_LIBRARY_ROOT = Path.home() / "Documents" / "Library"
@@ -80,6 +85,7 @@ class Paths:
     profile_dir: Path
     workspace: Path | None
     option_file: Path
+    source_prefix: str = DEFAULT_SOURCE_PREFIX
 
     # ── 派生路径 ────────────────────────────────────────────────────────
     @property
@@ -188,6 +194,7 @@ class Paths:
             "profile_dir": str(self.profile_dir),
             "workspace": str(self.workspace) if self.workspace else None,
             "option_file": str(self.option_file),
+            "source_prefix": self.source_prefix,
         }
 
 
@@ -238,6 +245,7 @@ def resolve_paths(
     scripts_dir: str | Path | None = None,
     profile_dir: str | Path | None = None,
     option_file: str | Path | None = None,
+    source_prefix: str | None = None,
 ) -> Paths:
     """按「参数 > 环境变量 > 探测到的默认值」的优先级解析路径。"""
 
@@ -257,4 +265,9 @@ def resolve_paths(
         profile_dir=pick(profile_dir, "", default_profile_dir()).resolve(),
         workspace=workspace,
         option_file=pick(option_file, "", default_option_file(workspace)),
+        source_prefix=(
+            source_prefix
+            if source_prefix is not None
+            else (os.environ.get(ENV_SOURCE_PREFIX) or DEFAULT_SOURCE_PREFIX)
+        ),
     )

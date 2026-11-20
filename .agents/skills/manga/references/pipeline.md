@@ -53,6 +53,17 @@ manga verify                           # 退出码 0 才算入库成功
 `--generate-comicinfo`：包内没有 `ComicInfo.xml` 时生成一份；**已存在则保留原样，不覆盖**。
 `--zero-pad`：纯数字话号补零到 3 位（`1` → `001`），同系列内排序才稳。
 
+**信封里的 `data.report` 与 `elapsed_s`**：`convert-cbz` / `ingest` 会把脚本 stdout
+解析成结构化报告（计数 + 截断明细），成功信封能直接回答「打了几个、跳了几个、
+错了几个、跑了多久」——agent 不必再列目录核对。明细最多 20 条（`truncated: true` 表示截断）；
+`report.parsed: false` 说明输出认不出（旧版工作区脚本），此时回退到列目录核对。
+`convert-cbz` 计数叫 `planned_or_succeeded`：dry-run 时是计划数，`--apply` 时是成功数。
+
+**取消安全**：两个脚本命令的子进程默认有 1 小时超时兜底，句柄注册进取消看门狗——
+`job cancel` 时 pwsh 会被一并杀掉，不再留孤儿进程继续写包/删源图。
+CBZ 打包是**原子写**（先 `.tmp` 完整写完再落位），中途被杀只会留下可自愈的 `.tmp` 残件，
+不会产生冒充成品的残缺包。
+
 ## 4. 命名规范（唯一口径）
 
 ```

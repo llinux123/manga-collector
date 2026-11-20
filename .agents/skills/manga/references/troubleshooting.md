@@ -61,6 +61,7 @@ manga doctor      # PowerShell？脚本在不在？jmcomic 装没装？代理端
 | 沙箱内 pytest 临时目录不可写 | 本项目**不用** pytest 的 `tmp_path`/`--basetemp`：Windows 上 `\\?\` 扩展路径前缀沙箱不认，`tempfile.mkdtemp` 又会给目录套受限权限 → 改用 `tests/conftest.py` 的 `workdir` fixture（工作区内普通 `mkdir`）。普通命令不受影响 |
 | `uv` 报缓存权限错 | 设 `UV_CACHE_DIR=<仓库>\.uv-cache` |
 | Python 建的临时目录里不能再建子目录 | Windows 下 `tempfile.mkdtemp` 会套受限权限；用普通 `mkdir` |
+| 作业报 `succeeded` 但落点目录是空的（假成功） | DSH 沙箱把**工作区外**的写拦了（书库在 `%USERPROFILE%\Documents\Library`，不在会话工作区内），子进程写失败但没冒泡。治本：按 SKILL.md §7 用 `.manga-tmp\` 仓内暂存，只有 `ingest` 碰书库；治标：`--apply` 后**列目录核对产物数 > 0**，别只信 `ok: true` |
 
 ## 5b. 依赖与登录态（P4 加固后新增）
 

@@ -54,8 +54,13 @@
 └── Export\Manga\             # Syncthing 共享区（**本项目只读 + 守卫**）
 ```
 
-**红线**：灰色来源的产物只允许出现在 `00-Incoming\*` 与 `Manga\Library`，
-**绝不允许**进入 `Export\Manga`。`manga guard` 以退出码 6 拒绝。
+**仓内暂存**：书库在 DSH 会话工作区之外，沙箱模式下每次写都要授权、且被拒时可能静默失败。
+所以采集的中间产物（散图、待入库 CBZ）允许暂存在**本仓库内**的 `.manga-tmp\`
+（已在 `.gitignore`），跑通后由 `ingest --inbox-root .manga-tmp\cbz` 一次性入库——
+这是 DSH 沙箱会话的推荐流程，详见 `.agents/skills/manga/SKILL.md` §7。
+
+**红线**：灰色来源的产物只允许出现在 `.manga-tmp\`（仓内暂存）、`00-Incoming\*` 与
+`Manga\Library`，**绝不允许**进入 `Export\Manga`。`manga guard` 以退出码 6 拒绝。
 
 ## 5. 命名与元数据口径
 

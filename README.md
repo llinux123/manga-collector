@@ -80,6 +80,7 @@ manga convert-cbz            # 散图 → CBZ
 manga ingest                 # 干跑入库
 manga ingest --apply --generate-comicinfo --zero-pad
 manga verify                 # 校验闸门：退出码 0 才算入库成功
+manga lookup 404005          # 判断某车号是否已在库（ComicInfo 的 jm:<id>，--title 兜底）
 
 # 4) 红线守卫：共享区新增文件 → 退出码 6
 manga guard --snapshot .export-snapshot.json
