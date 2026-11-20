@@ -35,5 +35,6 @@ include = ["src/manga", "tools", "tests", "docs", "README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# 沙箱内 %TEMP% 不可写：pytest 的临时目录必须落在工作区内，并关闭会写临时目录的 cacheprovider
-addopts = "-q -p no:cacheprovider"
+# 沙箱内 %TEMP% 不可写：pytest 的临时目录必须落在工作区内，并关闭会写临时目录的 cacheprovider。
+# --basetemp 让内置 tmp_path/tmp_path_factory 也落在工作区（.gitignore 已覆盖 .pytest-tmp/）。
+addopts = "-q -p no:cacheprovider --basetemp=.pytest-tmp"

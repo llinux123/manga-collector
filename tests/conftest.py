@@ -53,6 +53,8 @@ def make_cbz(
     number: int = 1,
     title: str = "Chapter One",
     series: str = "Sample Series",
+    notes: str = "",
+    web: str = "",
 ) -> Path:
     """造一个合规的 CBZ：图片平铺在包根目录 + 根目录 ComicInfo.xml。"""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,6 +64,13 @@ def make_cbz(
         .replace("<Series>Sample Series</Series>", f"<Series>{series}</Series>")
         .replace("<PageCount>5</PageCount>", f"<PageCount>{pages}</PageCount>")
     )
+    extra = ""
+    if notes:
+        extra += f"  <Notes>{notes}</Notes>\n"
+    if web:
+        extra += f"  <Web>{web}</Web>\n"
+    if extra:
+        info = info.replace("</ComicInfo>", extra + "</ComicInfo>")
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as zf:
         for i in range(1, pages + 1):
             zf.writestr(f"{i:05d}.jpg", _TINY_JPEG)

@@ -118,6 +118,35 @@ class TestMangadexDlCli:
         assert payload["data"]["dry_run"] is True
         assert "--language zh" in payload["data"]["command"]
 
+    def test_adapter_warnings_reach_envelope_top_level(
+        self, monkeypatch: pytest.MonkeyPatch, workdir: Path
+    ) -> None:
+        """适配层的 warnings 必须冒到信封顶层 —— agent 只读信封的 warnings 字段。"""
+        from manga.adapters import mangadex_dl
+
+        monkeypatch.setattr(mangadex_dl, "find_executable", lambda **kwargs: Path("mangadex-dl"))
+        monkeypatch.setattr(
+            mangadex_dl,
+            "download",
+            lambda *a, **k: {
+                "dest": str(workdir),
+                "count": 1,
+                "files": ["a.cbz"],
+                "comicinfo": {"with": 0, "without": 1},
+                "warnings": ["1 个 CBZ 里没有 ComicInfo.xml"],
+            },
+        )
+        code, payload = _invoke(
+            "mangadex-dl",
+            "https://mangadex.org/title/x",
+            "--apply",
+            "--dest",
+            str(workdir / "inbox"),
+        )
+        assert code == EXIT_OK
+        assert any("ComicInfo" in w for w in payload["warnings"])
+        assert "warnings" not in payload["data"]
+
 
 class TestActionsGenCli:
     def test_dry_run_reports_but_writes_nothing(self, workdir: Path) -> None:

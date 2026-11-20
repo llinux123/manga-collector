@@ -118,6 +118,9 @@ class TestLifecycle:
         """子进程被强杀（没写终态）→ 状态判为 failed，并说明原因。"""
         state = jobs.start(store, "version", [])
         _wait_terminal(store, state.id)
+        # 子进程写完终态就退出，但退出有一小段时间差 —— 等它真的没了，
+        # 否则「进程还活着」会被当成「仍在运行」，用例变成竞态。
+        _wait_dead(state.pid)
         # 抹掉终态报告，模拟「子进程没来得及写」
         store.final_path(state.id).unlink(missing_ok=True)
         assert jobs.current_state(store, state.id) == jobs.STATE_FAILED
@@ -196,6 +199,125 @@ class TestCancel:
         assert current.exit_code == EXIT_CANCELLED
 
 
+class TestCancelHonesty:
+    """取消必须「说了就算」—— 进程还活着就不能报 cancelled（P1）。
+
+    之前：``request_cancel`` 写标记失败 + ``_kill_tree`` 被沙箱拒绝 → 函数照样
+    返回 ``state=cancelled``，于是作业状态说「已停」，实际上子进程还在下载，
+    还在往库里写文件。agent 看到 cancelled 就重跑，产物互相踩。
+    """
+
+    def test_cancel_fails_when_process_is_still_alive(
+        self, store: jobs.JobStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        state = jobs.start(store, "version", [], items=["a"])
+        _write_progress(store, state.id, {"items": ["a"]})
+
+        monkeypatch.setattr(jobs, "request_cancel", lambda *a, **k: False)
+        monkeypatch.setattr(jobs, "_kill_tree", lambda pid: False)
+        monkeypatch.setattr(jobs, "_pid_alive", lambda pid: True)
+
+        with pytest.raises(MangaError) as excinfo:
+            jobs.cancel(store, state.id, grace=0.1)
+
+        assert excinfo.value.code == "CANCEL_FAILED"
+        assert excinfo.value.exit_code == 2
+
+        # 关键：状态**不能**被写成 cancelled（进程还在跑）
+        current = store.load(state.id)
+        assert current.state != jobs.STATE_CANCELLED
+        assert store.read_final(state.id) is None
+
+    def test_ctrl_break_branch_confirms_the_process_died(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """CTRL_BREAK 发出去不等于进程死了 —— 必须轮询确认。"""
+        if sys.platform != "win32":  # pragma: no cover - 仅 Windows 分支
+            pytest.skip("CTRL_BREAK 是 Windows 专有")
+
+        class _FakeProc:
+            returncode = 1
+
+        monkeypatch.setattr(jobs.subprocess, "run", lambda *a, **k: _FakeProc())
+        sent: list[int] = []
+        monkeypatch.setattr(jobs.os, "kill", lambda pid, sig: sent.append(sig))
+
+        # 进程确实退出了 → 强杀算成功
+        monkeypatch.setattr(jobs, "_pid_alive", lambda pid: False)
+        assert jobs._kill_tree(1234) is True
+        assert sent  # CTRL_BREAK 确实发出去了
+
+        # 进程还活着 → 强杀不算成功（不能骗人）
+        monkeypatch.setattr(jobs, "_pid_alive", lambda pid: True)
+        assert jobs._kill_tree(1234) is False
+
+
+class TestFinalizeHonesty:
+    """终态必须与信封一致（P1）。
+
+    ``exit == 0`` 只说明「进程退出码是 0」—— 如果子进程自己报了
+    ``ok=false``（比如下载失败），作业绝不能显示 succeeded。
+    """
+
+    def test_finalize_with_ok_false_is_failed(self, monkeypatch: pytest.MonkeyPatch, workdir: Path) -> None:
+        path = workdir / "final.json"
+        monkeypatch.setenv(jobs.ENV_JOB_FINAL, str(path))
+
+        assert jobs.finalize({"ok": False, "exit": 0, "error": {"message": "下载失败"}}) is True
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["state"] == jobs.STATE_FAILED
+        assert payload["error"] == "下载失败"
+
+    def test_finalize_with_ok_true_stays_succeeded(self, monkeypatch: pytest.MonkeyPatch, workdir: Path) -> None:
+        path = workdir / "final.json"
+        monkeypatch.setenv(jobs.ENV_JOB_FINAL, str(path))
+
+        assert jobs.finalize({"ok": True, "exit": 0}) is True
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["state"] == jobs.STATE_SUCCEEDED
+
+    def test_finalize_without_ok_field_is_succeeded(self, monkeypatch: pytest.MonkeyPatch, workdir: Path) -> None:
+        """老信封没有 ok 字段时不能当成失败（向后兼容）。"""
+        path = workdir / "final.json"
+        monkeypatch.setenv(jobs.ENV_JOB_FINAL, str(path))
+
+        assert jobs.finalize({"exit": 0}) is True
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["state"] == jobs.STATE_SUCCEEDED
+
+
+class TestEffectiveStateReporting:
+    """列表 / 轮询必须显示**真实**状态（P1）。
+
+    之前：``store.list()`` 直接读 ``state.json``，父进程写的是 running，
+    子进程早就写好 succeeded 了 —— 列表里仍显示 running。
+    """
+
+    def test_list_uses_effective_state(self, store: jobs.JobStore) -> None:
+        state = jobs.start(store, "version", [])
+        _wait_terminal(store, state.id)
+
+        listed = {s.id: s for s in store.list()}
+        assert state.id in listed
+        assert listed[state.id].state == jobs.STATE_SUCCEEDED
+
+    def test_elapsed_uses_finished_at(self, store: jobs.JobStore) -> None:
+        """终态作业的耗时必须固定，不能随轮询时间一直涨。"""
+        state = jobs.start(store, "version", [])
+        _wait_terminal(store, state.id)
+
+        first = jobs.poll(store, state.id)["elapsed_s"]
+        time.sleep(1.1)
+        second = jobs.poll(store, state.id)["elapsed_s"]
+        assert first == second, "终态后耗时不该继续增长"
+
+    def test_elapsed_is_zero_for_unfinished_job_without_start(self, store: jobs.JobStore) -> None:
+        state = jobs.JobState(id="x", command="version")
+        assert jobs._elapsed_seconds(state) == 0.0
+
+
+
 class TestJobList:
     def test_list_returns_recent_jobs(self, store: jobs.JobStore) -> None:
         jobs.start(store, "version", [])
@@ -214,6 +336,17 @@ def _write_progress(store: jobs.JobStore, job_id: str, payload: dict) -> None:
     path = store.progress_path(job_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _wait_dead(pid: int | None, timeout: float = 20) -> None:
+    """等子进程真的退出（避免「刚写完终态还在收尾」的竞态）。"""
+    if not pid:
+        return
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not jobs._pid_alive(pid):
+            return
+        time.sleep(0.1)
 
 
 def _wait_terminal(store: jobs.JobStore, job_id: str, timeout: float = 30) -> None:

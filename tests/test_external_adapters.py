@@ -555,3 +555,71 @@ class TestMangaDex:
         assert mangadex_dl.has_comicinfo(good) is True
         assert mangadex_dl.has_comicinfo(bad) is False
         assert mangadex_dl.has_comicinfo(broken) is False
+
+
+# ── P1：mangadex-dl 的三种「假成功」 ───────────────────────────────────────
+
+
+class TestMangaDexFailureSemantics:
+    """mangadex-dl 有三种「看起来成功、其实没成」的形态，必须显式失败或告警。
+
+    1. **退出码非 0 但产物已写出** —— 之前直接返回 ok，agent 会以为下好了；
+    2. **产物里有读不动的 CBZ** —— 坏包会一路走进库闸门；
+    3. **产物缺 ComicInfo.xml** —— 不算失败，但必须作为 warnings 上报。
+    """
+
+    def test_nonzero_exit_with_artifacts_is_download_failed(
+        self, monkeypatch: pytest.MonkeyPatch, workdir: Path
+    ) -> None:
+        def on_call(argv: list[str], kwargs: dict) -> None:
+            target = Path(_arg_value(argv, "--path"))
+            _make_cbz(target / "S" / "001.cbz", comicinfo=True)
+
+        recorder = _Recorder(stdout="partial\n", stderr="[ERROR] chapter 2 failed\n", returncode=1)
+        recorder.on_call = on_call
+        _install(monkeypatch, recorder, tools={"mangadex-dl": r"C:\fake\mangadex-dl.exe"})
+
+        with pytest.raises(MangaError) as excinfo:
+            mangadex_dl.download("https://mangadex.org/title/xxx", workdir / "inbox")
+
+        assert excinfo.value.code == "DOWNLOAD_FAILED"
+        assert excinfo.value.exit_code == EXIT_ERROR
+        assert excinfo.value.data.get("files")
+
+    def test_unreadable_cbz_is_corrupt_artifact(
+        self, monkeypatch: pytest.MonkeyPatch, workdir: Path
+    ) -> None:
+        def on_call(argv: list[str], kwargs: dict) -> None:
+            target = Path(_arg_value(argv, "--path"))
+            _make_cbz(target / "S" / "001.cbz", comicinfo=True)
+            broken = target / "S" / "002.cbz"
+            broken.parent.mkdir(parents=True, exist_ok=True)
+            broken.write_bytes(b"not a zip at all")
+
+        recorder = _Recorder(stdout="ok\n")
+        recorder.on_call = on_call
+        _install(monkeypatch, recorder, tools={"mangadex-dl": r"C:\fake\mangadex-dl.exe"})
+
+        with pytest.raises(MangaError) as excinfo:
+            mangadex_dl.download("https://mangadex.org/title/xxx", workdir / "inbox")
+
+        assert excinfo.value.code == "CORRUPT_ARTIFACT"
+        assert excinfo.value.exit_code == EXIT_ERROR
+        assert excinfo.value.data.get("unreadable")
+
+    def test_missing_comicinfo_becomes_warning(
+        self, monkeypatch: pytest.MonkeyPatch, workdir: Path
+    ) -> None:
+        def on_call(argv: list[str], kwargs: dict) -> None:
+            target = Path(_arg_value(argv, "--path"))
+            _make_cbz(target / "S" / "001.cbz", comicinfo=False)
+
+        recorder = _Recorder(stdout="ok\n")
+        recorder.on_call = on_call
+        _install(monkeypatch, recorder, tools={"mangadex-dl": r"C:\fake\mangadex-dl.exe"})
+
+        result = mangadex_dl.download("https://mangadex.org/title/xxx", workdir / "inbox")
+
+        assert result["comicinfo"] == {"with": 0, "without": 1}
+        assert result["warnings"], "缺 ComicInfo.xml 必须以 warnings 上报"
+        assert any("ComicInfo" in w for w in result["warnings"])

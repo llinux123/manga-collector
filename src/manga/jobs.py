@@ -217,6 +217,13 @@ class JobStore:
         return JobState.from_dict(raw)
 
     def list(self, limit: int = 20) -> list[JobState]:
+        """列出最近的作业。
+
+        ⚠ 状态取的是**真实**状态（:func:`_effective_state`）—— 父进程写的
+        ``state.json`` 永远是「启动时的样子」（running），子进程真正的终态在
+        ``final.json`` 里。之前这里直接读 state.json → 列表里所有跑完的作业
+        仍显示 running。
+        """
         if not self.root.is_dir():
             return []
         states: list[JobState] = []
@@ -224,9 +231,16 @@ class JobStore:
             if not (directory / "state.json").is_file():
                 continue
             try:
-                states.append(self.load(directory.name))
+                state = self.load(directory.name)
             except (OSError, ValueError):
                 continue
+            effective, final = _effective_state(self, state)
+            if effective != state.state:
+                state.state = effective
+                if final:
+                    state.exit_code = final.get("exit_code", state.exit_code)
+                    state.finished_at = final.get("finished_at", state.finished_at)
+            states.append(state)
             if len(states) >= limit:
                 break
         return states
@@ -499,14 +513,21 @@ def finalize(envelope: dict[str, Any]) -> bool:
     所以终态由**子进程自己**写（它知道自己几时退出、退出码是多少）。
 
     不在作业里跑就什么都不做。
+
+    ⚠ **退出码 0 不等于成功**：子进程可能自己报了 ``ok=false``（下载失败、
+    红线拒绝…）却仍以 0 退出。这种情况必须判为 failed —— 否则作业显示
+    succeeded，agent 以为拿到结果了。
     """
     path_text = os.environ.get(ENV_JOB_FINAL)
     if not path_text:
         return False
     exit_code = int(envelope.get("exit", 0) or 0)
+    ok_field = envelope.get("ok")
+    # ok 字段缺省（老信封）时按退出码判断；显式为 false 一律算失败。
+    succeeded = exit_code == 0 and ok_field is not False
     if exit_code == EXIT_CANCELLED:
         state = STATE_CANCELLED
-    elif exit_code == 0:
+    elif succeeded:
         state = STATE_SUCCEEDED
     else:
         state = STATE_FAILED
@@ -514,6 +535,7 @@ def finalize(envelope: dict[str, Any]) -> bool:
     payload = {
         "state": state,
         "exit_code": exit_code,
+        "ok": bool(ok_field) if ok_field is not None else succeeded,
         "warnings": list(envelope.get("warnings") or []),
         "error": error.get("message") if isinstance(error, dict) else error,
         "data": envelope.get("data"),
@@ -527,18 +549,29 @@ def finalize(envelope: dict[str, Any]) -> bool:
 
 
 def _pid_alive(pid: int | None) -> bool:
-    """进程还在吗？（用来发现「子进程没了却没写终态」的孤儿作业）"""
+    """进程还在吗？（用来发现「子进程没了却没写终态」的孤儿作业）
+
+    ⚠ Windows：``OpenProcess`` 成功**不代表进程还活着** —— 只要句柄还被
+    内核对象引用着（例如 PID 被复用、或退出后对象尚未释放），已退出的进程
+    也能打开。必须再查退出码：``STILL_ACTIVE (259)`` 才是真的在跑。
+    """
     if not pid:
         return False
     if sys.platform == "win32":
         try:
             import ctypes
 
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
             if not handle:
                 return False
-            ctypes.windll.kernel32.CloseHandle(handle)
-            return True
+            try:
+                exit_code = ctypes.c_ulong()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return True  # 查不了退出码 → 保守当它还在
+                return exit_code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
         except Exception:  # noqa: BLE001 - 体检性问题，不该影响主流程
             return True  # 判断不了就当它还在
     try:
@@ -569,10 +602,16 @@ def _effective_state(store: JobStore, state: JobState) -> tuple[str, dict[str, A
 # ── 轮询 / 取消 / 结果 ────────────────────────────────────────────────────
 
 
-def _elapsed_seconds(state: JobState) -> float:
+def _elapsed_seconds(state: JobState, *, final: dict[str, Any] | None = None) -> float:
+    """作业耗时（秒）。
+
+    终态作业的耗时必须**固定**：子进程的 ``final.json`` 里有 ``finished_at``，
+    用它算；没有才回退到「现在」—— 否则每轮 poll 的耗时都在涨，agent
+    无法用它判断作业跑了多久。
+    """
     if not state.started_at:
         return 0.0
-    end = state.finished_at or _now()
+    end = state.finished_at or (final or {}).get("finished_at") or _now()
     try:
         start_dt = datetime.fromisoformat(state.started_at)
         end_dt = datetime.fromisoformat(end)
@@ -600,7 +639,7 @@ def poll(store: JobStore, job_id: str) -> dict[str, Any]:
         "job_id": state.id,
         "state": current,
         "command": state.command,
-        "elapsed_s": round(_elapsed_seconds(state), 1),
+        "elapsed_s": round(_elapsed_seconds(state, final=final), 1),
         "items_total": len(items),
         "items_done": len(done),
         "items_failed": len(failed),
@@ -622,6 +661,11 @@ def cancel(store: JobStore, job_id: str, *, grace: float = 6.0) -> dict[str, Any
     1. 写取消标记 → 子进程自己看到并优雅退出（**不需要任何特权**）；
     2. 等它退出（最多 ``grace`` 秒）；
     3. 还活着才用强杀兜底（taskkill / CTRL_BREAK / SIGTERM 逐个试）。
+
+    ⚠ **「说了就算」**：如果既写不了取消标记、强杀也没杀掉进程，
+    就**不能**报 cancelled —— 子进程还在跑、还在往库里写文件，状态却说
+    「已停」，agent 就会重跑并把产物踩坏。这种情况抛 ``CANCEL_FAILED``
+    （退出码 2），状态保持原样。
     """
     state = store.load(job_id)
     current, _ = _effective_state(store, state)
@@ -648,12 +692,42 @@ def cancel(store: JobStore, job_id: str, *, grace: float = 6.0) -> dict[str, Any
     killed = False
     if not exited:
         killed = _kill_tree(state.pid)
+        # 强杀只是「发出去了」—— 要确认进程真的死了才算数
+        if killed:
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if not _pid_alive(state.pid):
+                    break
+                time.sleep(0.2)
+            exited = not _pid_alive(state.pid)
 
     progress = store.read_progress(job_id)
     done = list(progress.get("done", state.done))
     failed = list(progress.get("failed", state.failed))
     items = list(progress.get("items", state.items))
     unfinished = [i for i in items if i not in done and i not in failed]
+
+    # 进程还活着 → 取消**没有生效**。绝不能写 cancelled（会骗 agent）。
+    if not exited:
+        raise MangaError(
+            f"取消失败：作业 {job_id} 的进程仍在运行（PID {state.pid}）",
+            code="CANCEL_FAILED",
+            exit_code=EXIT_ERROR,
+            hint=(
+                "取消标记"
+                + ("已写入但子进程没响应" if asked else "写不进去")
+                + "；强杀也被环境拒绝。请在宿主上直接结束该进程，"
+                "或改用协作式取消（子进程自己盯着 cancel.request）"
+            ),
+            data={
+                "job_id": job_id,
+                "pid": state.pid,
+                "cancel_requested": asked,
+                "killed": killed,
+                "completed": done,
+                "unfinished": unfinished,
+            },
+        )
 
     state.state = STATE_CANCELLED
     state.finished_at = _now()
@@ -705,29 +779,50 @@ def _kill_tree(pid: int | None) -> bool:
                 timeout=15,
                 check=False,
             )
-            if proc.returncode == 0:
+            if proc.returncode == 0 and _wait_dead(pid):
                 return True
         except (OSError, subprocess.SubprocessError):
             pass
         # ② CTRL_BREAK：给整个进程组发中断（不需要特权）
+        #
+        # ⚠ 「信号发出去了」≠「进程死了」—— CTRL_BREAK 可能被忽略或延迟处理。
+        # 必须轮询确认真的退出了才算强杀成功，否则调用方会以为它停了，
+        # 实际子进程还在下载、还在往库里写文件。
         try:
             os.kill(pid, signal.CTRL_BREAK_EVENT)
-            return True
         except (OSError, AttributeError, ValueError):
-            pass
-        return False
+            return False
+        return _wait_dead(pid)
 
     # POSIX：先杀进程组，再退回单进程
     try:
         os.killpg(os.getpgid(pid), signal.SIGTERM)
-        return True
+        if _wait_dead(pid):
+            return True
     except (OSError, ProcessLookupError):
         pass
     try:
         os.kill(pid, signal.SIGTERM)
-        return True
     except OSError:
         return False
+    return _wait_dead(pid)
+
+
+def _wait_dead(pid: int | None, *, timeout: float = 3.0) -> bool:
+    """等进程真的退出（最多 ``timeout`` 秒）。
+
+    信号只是「请求」—— 进程可能正在收尾、也可能完全无视。确认它不在了
+    才算强杀成功。
+    """
+    if not pid:
+        return False
+    deadline = time.time() + timeout
+    while True:
+        if not _pid_alive(pid):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
 
 
 def result(store: JobStore, job_id: str) -> dict[str, Any]:
@@ -741,7 +836,7 @@ def result(store: JobStore, job_id: str) -> dict[str, Any]:
         "job_id": state.id,
         "state": current,
         "command": state.command,
-        "elapsed_s": round(_elapsed_seconds(state), 1),
+        "elapsed_s": round(_elapsed_seconds(state, final=final), 1),
         "exit_code": (final or {}).get("exit_code", state.exit_code),
         "items": list(progress.get("items", state.items)),
         "done": list(progress.get("done", state.done)),

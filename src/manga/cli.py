@@ -18,6 +18,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ import typer
 
 from . import __version__
 from . import actions_gen
+from . import catalog
 from . import favorites as favorites_mod
 from . import jobs
 from . import servers
@@ -120,6 +122,14 @@ def _start_cancel_watchdog() -> None:
         #    （这些进程是本进程起的，Popen.kill 不需要特权）
         try:
             gallery_dl.kill_active()
+        except Exception:  # noqa: BLE001
+            pass
+        # ③ 流水线脚本子进程（verify / ingest / convert-cbz 正在跑的 pwsh）——
+        #    同样是本进程起的，必须杀掉：否则 CLI 被 os._exit 后 pwsh 变孤儿，
+        #    继续写包 / 删源图，而作业状态已经是 cancelled（状态分叉）。
+        #    脚本侧写 CBZ 是 tmp + 原子落位，中途被杀只留可自愈的 .tmp。
+        try:
+            pipeline.kill_active()
         except Exception:  # noqa: BLE001
             pass
 
@@ -239,7 +249,13 @@ def _script_result_to_envelope(
     data: dict[str, Any] | None = None,
     extra_warnings: list[str] | None = None,
 ) -> Envelope:
-    """把 PS 脚本结果翻译成信封：0 → ok；1 → ok + warnings；2 → 错误。"""
+    """把 PS 脚本结果翻译成信封：0 → ok；1 → ok + warnings（有报告时）；其余 → 错误。
+
+    exit 1 的判别（P1 修复）：PS 脚本**未处理的运行时异常**也常以退出码 1 结束，
+    与「有冲突/告警」的约定码撞车。区分依据是输出形态：
+    stdout 里解析不出任何已知汇总块（parsed=False）且 stderr 非空 →
+    视为异常终止（SCRIPT_ERROR），不包装成成功信封。
+    """
     warnings = list(extra_warnings or [])
     if result.warned:
         warnings.append(f"{result.script} 退出码 1：有冲突或告警（不是错误）")
@@ -249,6 +265,28 @@ def _script_result_to_envelope(
             warnings.append(f"{result.script} 输出尾部：{tail}")
     payload: dict[str, Any] = {"script": result.script, "exit_code": result.exit_code}
     payload.update(data or {})
+
+    # exit 1 异常判别：报告解析器认不出输出（无任何已知汇总块）且 stderr 在说话
+    if result.exit_code == pipeline.PS_EXIT_WARN:
+        parsed = any(
+            (payload.get(key) or {}).get("parsed", False)
+            for key in ("report",)
+            if isinstance(payload.get(key), dict)
+        )
+        stderr_speaks = bool((result.stderr or "").strip())
+        if not parsed and stderr_speaks:
+            return Envelope(
+                ok=False,
+                data=payload,
+                error={
+                    "code": "SCRIPT_ERROR",
+                    "message": f"{result.script} 异常终止（退出码 1 且无有效报告，见 stderr）",
+                    "hint": (result.stderr or "").strip()[-2000:] or None,
+                },
+                warnings=warnings,
+                exit=EXIT_ERROR,
+            )
+
     if result.failed:
         return Envelope(
             ok=False,
@@ -546,6 +584,9 @@ def ingest(
     """入库整理（对应 Invoke-LibraryIngest.ps1）：重命名 + 写元数据 + 移入权威库。
 
     **默认 dry-run**；--apply 才落盘（会先备份）。
+    收件箱里的相对层级会**原样保留**到库里：
+    ``<收件箱>\\<来源>\\<书名>\\*.cbz`` → ``<库>\\<来源>\\<书名>\\*.cbz``
+    （与 Hakuneko 的「来源名/书名」结构一致）；只有一层时保持单层。
     运行期间会守住红线：``Export\\Manga`` 不得有任何新增。
     """
 
@@ -568,16 +609,27 @@ def ingest(
         if apply:
             args.append("-Apply")
 
+        started = time.monotonic()
         with pipeline.ExportGuard(p.export) as guard:
             result = pipeline.run_script(script, args)
             guard.assert_unchanged()
+        elapsed = round(time.monotonic() - started, 1)
 
+        report = pipeline.parse_ingest_report(result.stdout)
         warnings: list[str] = []
         if not apply:
             warnings.append("dry-run：未加 --apply，未落盘")
+        if report.get("nothing_to_do"):
+            warnings.append("收件箱里没有 CBZ（nothing_to_do）——确认 inbox_root 指向正确")
         return _script_result_to_envelope(
             result,
-            data={"dry_run": not apply, "library_root": str(p.library), "inbox_root": str(inbox_root or p.inbox)},
+            data={
+                "dry_run": not apply,
+                "library_root": str(p.library),
+                "inbox_root": str(inbox_root or p.inbox),
+                "report": report,
+                "elapsed_s": elapsed,
+            },
             extra_warnings=warnings,
         )
 
@@ -590,31 +642,56 @@ def convert_cbz(
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
     source_root: str | None = typer.Option(None, "--source-root", help="jmcomic 散图目录（默认 <library-root>\\00-Incoming\\_raw_jmcomic）"),
     target_root: str | None = typer.Option(None, "--target-root", help="收件箱（默认 <library-root>\\00-Incoming\\Manga）"),
+    source_prefix: str | None = typer.Option(None, "--source-prefix", help="来源层目录名（默认「禁漫 (JMComic)」）；传空串则不建来源层"),
     apply: bool = typer.Option(False, "--apply", help="真正写文件；不加就是 dry-run"),
     keep_images: bool = typer.Option(False, "--keep-images", help="打包后保留原始图片"),
 ) -> None:
-    """把 jmcomic 下载的章节图片打包成 ``<编号> - <标题>.cbz``（对应 Convert-JmComicToCbz.ps1）。"""
+    """把 jmcomic 下载的章节图片打包成 ``<编号> - <标题>.cbz``（对应 Convert-JmComicToCbz.ps1）。
+
+    **默认 dry-run**；--apply 才写文件。
+    ``--source-prefix`` 会多出一层来源目录，与 Hakuneko 的「来源名/书名」结构对齐。
+    """
 
     def run() -> Envelope:
         p = _paths(library_root, scripts_dir)
         script = p.script(pipeline.SCRIPT_CBZ)
+        # 来源层：显式参数 > 环境变量 > 默认「禁漫 (JMComic)」；传空串表示不要来源层
+        prefix = p.source_prefix if source_prefix is None else source_prefix
         args: list[str] = [
             "-SourceRoot", str(source_root or p.raw_jmcomic),
             "-TargetRoot", str(target_root or p.inbox),
         ]
+        if prefix:
+            args += ["-SourcePrefix", prefix]
         if keep_images:
             args.append("-KeepImages")
         if apply:
             args.append("-Apply")
 
+        started = time.monotonic()
         with pipeline.ExportGuard(p.export) as guard:
             result = pipeline.run_script(script, args)
             guard.assert_unchanged()
+        elapsed = round(time.monotonic() - started, 1)
 
+        # 成功信封里也要能回答「打了几个、跳了几个、错了几个」——
+        # 过去 stdout 被丢弃，agent 只能再花一次调用去列目录核对
+        report = pipeline.parse_cbz_report(result.stdout)
         warnings = [] if apply else ["dry-run：未加 --apply，未写文件"]
+        if report.get("nothing_to_do"):
+            warnings.append(
+                "源目录下没有可打包的章节目录（nothing_to_do）——确认 source_root 指向的是「本子/章节/散图」两层结构"
+            )
         return _script_result_to_envelope(
             result,
-            data={"dry_run": not apply, "source_root": str(source_root or p.raw_jmcomic), "target_root": str(target_root or p.inbox)},
+            data={
+                "dry_run": not apply,
+                "source_root": str(source_root or p.raw_jmcomic),
+                "target_root": str(target_root or p.inbox),
+                "source_prefix": prefix,
+                "report": report,
+                "elapsed_s": elapsed,
+            },
             extra_warnings=warnings,
         )
 
@@ -790,6 +867,7 @@ def search(
 @app.command()
 def album(
     album_id: str = typer.Argument(..., help="本子 ID（禁漫车号）"),
+    impl: str | None = typer.Option(None, "--impl", help="api|html（默认取 option）"),
     option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
@@ -806,10 +884,38 @@ def album(
 
 
 @app.command()
+def lookup(
+    album_id: str | None = typer.Argument(None, help="车号（禁漫 album id）"),
+    title: str | None = typer.Option(None, "--title", help="标题（车号未命中时的兜底匹配）"),
+    library_root: str | None = typer.Option(None, "--library-root"),
+) -> None:
+    """判断一本漫画是否已在库中：先按车号精确判，再按标题兜底。
+
+    车号来自 CBZ 内 ``ComicInfo.xml`` 的 ``<Notes>jm:<id></Notes>``（或 ``<Web>`` 的
+    ``/album/<id>/``）。只读本地权威库，不联网。
+    """
+
+    def run() -> Envelope:
+        if not album_id and not title:
+            raise MangaError(
+                "至少给一个 --title 或车号",
+                code="MISSING_QUERY",
+                exit_code=EXIT_USAGE,
+                hint="例如：manga lookup 404005  或  manga lookup --title '某本漫画'",
+            )
+        p = _paths(library_root, None)
+        data = catalog.lookup(p.library, album_id=album_id, title=title)
+        return Envelope(ok=True, data=data)
+
+    _run("lookup", run)
+
+
+@app.command()
 def comments(
     album_id: str = typer.Argument(..., help="本子 ID"),
     page: int = typer.Option(1, "--page"),
     limit: int = typer.Option(50, "--limit"),
+    impl: str | None = typer.Option(None, "--impl", help="api|html（默认取 option）"),
     option_file: str | None = typer.Option(None, "--option", help="jmcomic option 变体配置"),
     library_root: str | None = typer.Option(None, "--library-root"),
     scripts_dir: str | None = typer.Option(None, "--scripts-dir"),
@@ -891,6 +997,36 @@ def download(
                 f"{data['degraded']} 个 ID 取不到元数据（站点抽风 / 代理不通 / 本子不存在）——"
                 "干跑已降级为最小计划，加 --apply 前先确认"
             )
+
+        # P1：--apply 模式下有失败或零产物 → 绝不幸幸成功（exit 2）
+        if apply:
+            failed_map = data.get("failed") or {}
+            file_count = int(data.get("file_count") or 0)
+            if failed_map and file_count > 0:
+                raise MangaError(
+                    f"部分 ID 下载失败（{len(failed_map)}/{len(ids)}）：{'、'.join(list(failed_map)[:5])}",
+                    code="PARTIAL_DOWNLOAD",
+                    exit_code=EXIT_ERROR,
+                    hint="失败详情见 data.failed；已下载的部分保留，重跑同一条命令续传",
+                    data=data,
+                )
+            if failed_map:
+                raise MangaError(
+                    f"下载失败：{'、'.join(list(failed_map)[:5])}",
+                    code="NO_ARTIFACT",
+                    exit_code=EXIT_ERROR,
+                    hint="失败详情见 data.failed；先 manga doctor / pick-domain 再重试",
+                    data=data,
+                )
+            if file_count == 0:
+                raise MangaError(
+                    "下载完成但 0 张图片落盘（假成功防护）",
+                    code="NO_ARTIFACT",
+                    exit_code=EXIT_ERROR,
+                    hint="确认 ID 有效、代理可用；先 manga album <id> 看章节数",
+                    data=data,
+                )
+
         return Envelope(ok=True, data=data, warnings=warnings)
 
     _run("download", run)
@@ -1200,7 +1336,10 @@ def mangadex_dl_cmd(
             timeout=timeout,
             extra_args=passthrough,
         )
-        return Envelope(ok=True, data=data)
+        # 适配层的 warnings（例如「有 CBZ 缺 ComicInfo.xml」）要冒到信封顶层 ——
+        # agent 只读信封的 warnings 字段，放在 data 里等于没说。
+        warnings = list(data.pop("warnings", []) or [])
+        return Envelope(ok=True, data=data, warnings=warnings)
 
     _run("mangadex-dl", run)
 
@@ -1427,7 +1566,18 @@ def job_start(
         if library_root:
             env_extra[ENV_LIBRARY_ROOT] = str(Path(library_root).expanduser().resolve())
         items = list(item) if item else _infer_items(ctx.args)
-        state = jobs.start(store, command, extra, items=items, env_extra=env_extra)
+        # 子进程 cwd = **调用者当前目录**，不是作业目录。
+        # 否则 `manga job start download 123 --dest .manga-tmp\raw` 会把下载产物
+        # 落到作业目录（<temp>/manga-jobs/<job_id>/）里 —— 那是临时目录，会被清理，
+        # 相对落点等于白下。相对路径必须相对用户敲命令的地方解析。
+        state = jobs.start(
+            store,
+            command,
+            extra,
+            items=items,
+            env_extra=env_extra,
+            cwd=Path.cwd(),
+        )
         return Envelope(
             ok=True,
             data={

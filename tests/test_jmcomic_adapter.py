@@ -177,6 +177,97 @@ class TestDryRunDegrade:
         assert "站点抽风" in plan["error"]
 
 
+# ── P1：逐 ID 驱动必须合并上游 BatchResult.failed ─────────────────────────
+
+
+class TestPerIdFailureMerge:
+    """作业模式的逐 ID 分支：上游把失败放进 BatchResult.failed（check_exception=False），
+    此前完全不读 → 失败 ID 被记成 done（假成功）。"""
+
+    class _FakeBatchResult:
+        def __init__(self, failed: dict | None = None):
+            self.failed = failed or {}
+
+        def __iter__(self):
+            return iter(())
+
+    def test_failed_id_reports_failed_progress(self, monkeypatch, library_root: Path) -> None:
+        fake = lambda: type("M", (), {"download_album": staticmethod(
+            lambda ids, option, **kw: self._FakeBatchResult(failed={"bad-id": RuntimeError("目标不存在")})
+        )})
+        monkeypatch.setattr(jm, "_jmcomic", fake)
+
+        events: list[tuple] = []
+        data = jm.download(
+            type("O", (), {"auth": {}})(),
+            ["bad-id"],
+            dest=library_root / "00-Incoming" / "_raw_jmcomic",
+            login=False,
+            on_progress=lambda event, item, error: events.append((event, item, error)),
+        )
+        assert data["failed"], "上游 failed 必须并入摘要"
+        assert "bad-id" in data["failed"]
+        assert any(e[0] == "failed" and e[1] == "bad-id" for e in events), events
+        assert not any(e[0] == "done" for e in events), "失败 ID 绝不能发 done"
+
+    def test_mixed_success_and_failure(self, monkeypatch, library_root: Path) -> None:
+        ok_entity = type("A", (), {"album_id": "ok-id", "name": "Good"})()
+        ok_dler = type("D", (), {"manifest_dict": {0: type("M", (), {"image_filepath_list": []})()}})()
+
+        def fake_download_album(ids, option, **kw):
+            target = ids[0]
+            if target == "bad-id":
+                return self.TestPerIdFailureMerge._FakeBatchResult(failed={target: RuntimeError("挂了")})
+            return [(ok_entity, ok_dler)]
+
+        fake = lambda: type("M", (), {"download_album": staticmethod(fake_download_album)})
+        monkeypatch.setattr(jm, "_jmcomic", fake)
+
+        events: list[tuple] = []
+        data = jm.download(
+            type("O", (), {"auth": {}})(),
+            ["ok-id", "bad-id"],
+            dest=library_root / "00-Incoming" / "_raw_jmcomic",
+            login=False,
+            on_progress=lambda event, item, error: events.append((event, item, error)),
+        )
+        assert data["requested"] == 2
+        assert [e[1] for e in events if e[0] == "done"] == ["ok-id"]
+        assert [e[1] for e in events if e[0] == "failed"] == ["bad-id"]
+
+    def test_all_failed_returns_nonzero_envelope(self, monkeypatch, library_root: Path) -> None:
+        """整批失败 → CLI 必须是非零信封（假成功防护）。
+
+        补丁要打在**下载器**上而不是整个 jmcomic 模块：option 构造仍然要用真实的
+        ``create_option_by_file``（否则只会得到 OPTION_INVALID，测不到下载分支）。
+        """
+        import jmcomic
+
+        def fake_download_album(ids, option, **kw):
+            return self.TestPerIdFailureMerge._FakeBatchResult(failed={ids[0]: RuntimeError("挂了")})
+
+        fake = type(
+            "M",
+            (),
+            {
+                "create_option_by_file": staticmethod(jmcomic.create_option_by_file),
+                "download_album": staticmethod(fake_download_album),
+            },
+        )
+        monkeypatch.setattr(jm, "_jmcomic", lambda: fake)
+        code, env = _invoke(
+            "download", "bad-id",
+            "--library-root", str(library_root),
+            "--dest", str(library_root / "00-Incoming" / "_raw_jmcomic"),
+            "--no-login",
+            "--apply",
+            "--option", str(Path(__file__).resolve().parents[1] / "config" / "jmcomic-option.yml"),
+        )
+        assert code == 2
+        assert env["ok"] is False
+        assert env["error"]["code"] in ("PARTIAL_DOWNLOAD", "NO_ARTIFACT")
+
+
 # ── 上游形态陷阱（P1 回归） ───────────────────────────────────────────────
 
 
@@ -274,3 +365,154 @@ class TestCliUsage:
         assert env["data"]["api_count"] > 0
         assert env["data"]["default_impl"] == "api"
         assert env["data"]["html_count"] == 0
+
+
+# ── P0：option 插件输出红线闸门 ────────────────────────────────────────────
+
+
+class TestOptionPluginRedLine:
+    """变体 option 里的输出插件不得把灰色产物写进共享区/权威库。
+
+    build_option 只覆盖 dir_rule.base_dir 是不够的 —— zip/img2pdf/long_img
+    等插件有独立的输出目录参数，必须在**调用下载器之前**逐一校验。
+    """
+
+    def _write_option(self, workdir: Path, plugins_yaml: str) -> Path:
+        import yaml
+
+        base = yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / "config" / "jmcomic-option.yml").read_text(
+                encoding="utf-8-sig"
+            )
+        )
+        base["plugins"] = yaml.safe_load(plugins_yaml)
+        # 测试环境没装 img2pdf 等可选依赖：failed-fast 会在构造阶段就拦下，
+        # 掩盖我们要测的红线闸门 → 变体统一用 ignore-only-log。
+        base["plugins"]["dependencies_strategy"] = "ignore-only-log"
+        option_file = workdir / "variant.yml"
+        option_file.write_text(yaml.safe_dump(base, allow_unicode=True), encoding="utf-8")
+        return option_file
+
+    def _dirs(self, library_root: Path) -> dict:
+        return {
+            "export_dir": library_root / "Export" / "Manga",
+            "library_dir": library_root / "Manga" / "Library",
+        }
+
+    def test_zip_plugin_into_export_is_refused_before_download(
+        self, workdir: Path, library_root: Path
+    ) -> None:
+        export = library_root / "Export" / "Manga"
+        option_file = self._write_option(
+            workdir,
+            f"""
+after_album:
+  - plugin: zip
+    kwargs:
+      zip_dir: "{export.as_posix()}"
+""",
+        )
+        with pytest.raises(MangaError) as excinfo:
+            jm.build_option(option_file, dest=workdir / "raw", **self._dirs(library_root))
+        assert excinfo.value.exit_code == EXIT_REFUSED
+        assert excinfo.value.code == "RED_LINE"
+        assert "zip" in excinfo.value.message
+
+    def test_nested_dir_rule_into_library_is_refused(self, workdir: Path, library_root: Path) -> None:
+        library = library_root / "Manga" / "Library"
+        option_file = self._write_option(
+            workdir,
+            f"""
+after_album:
+  - plugin: download_cover
+    kwargs:
+      dir_rule:
+        base_dir: "{library.as_posix()}"
+        rule: Bd_Aid
+""",
+        )
+        with pytest.raises(MangaError) as excinfo:
+            jm.build_option(option_file, dest=workdir / "raw", **self._dirs(library_root))
+        assert excinfo.value.exit_code == EXIT_REFUSED
+
+    def test_relative_path_resolved_against_cwd(self, workdir: Path, library_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """相对路径按进程 CWD 解析后仍要过闸门（不能靠相对写法绕过）。"""
+        export = library_root / "Export" / "Manga"
+        monkeypatch.chdir(library_root)
+        option_file = self._write_option(
+            workdir,
+            """
+after_photo:
+  - plugin: img2pdf
+    kwargs:
+      pdf_dir: "Export/Manga"
+""",
+        )
+        with pytest.raises(MangaError) as excinfo:
+            jm.build_option(option_file, dest=workdir / "raw", **self._dirs(library_root))
+        assert excinfo.value.exit_code == EXIT_REFUSED
+        assert str(export) in json.dumps(excinfo.value.data, ensure_ascii=False) or "Export" in excinfo.value.message
+
+    def test_unknown_output_plugin_is_refused(self, workdir: Path, library_root: Path) -> None:
+        """不在白名单里的插件（可能写文件/改路径）一律拒绝。"""
+        option_file = self._write_option(
+            workdir,
+            """
+after_init:
+  - plugin: replace_path_string
+    kwargs:
+      replace: {"00-Incoming": "Export"}
+""",
+        )
+        with pytest.raises(MangaError) as excinfo:
+            jm.build_option(option_file, dest=workdir / "raw", **self._dirs(library_root))
+        assert excinfo.value.exit_code == EXIT_REFUSED
+        assert "replace_path_string" in excinfo.value.message
+
+    def test_whitelisted_retry_plugin_passes(self, workdir: Path, library_root: Path) -> None:
+        option_file = self._write_option(
+            workdir,
+            """
+after_init:
+  - plugin: advanced_retry
+    kwargs:
+      retry_config:
+        retry_rounds: 3
+""",
+        )
+        option = jm.build_option(option_file, dest=workdir / "raw", **self._dirs(library_root))
+        assert option.dir_rule.base_dir == str(workdir / "raw")
+
+    def test_safe_zip_dir_passes(self, workdir: Path, library_root: Path) -> None:
+        raw = workdir / "raw"
+        option_file = self._write_option(
+            workdir,
+            f"""
+after_album:
+  - plugin: zip
+    kwargs:
+      zip_dir: "{raw.as_posix()}"
+""",
+        )
+        option = jm.build_option(option_file, dest=raw, **self._dirs(library_root))
+        assert option is not None
+
+    def test_cli_download_with_evil_option_exits_6(self, workdir: Path, library_root: Path) -> None:
+        export = library_root / "Export" / "Manga"
+        option_file = self._write_option(
+            workdir,
+            f"""
+after_album:
+  - plugin: zip
+    kwargs:
+      zip_dir: "{export.as_posix()}"
+""",
+        )
+        code, env = _invoke(
+            "download", "123456",
+            "--library-root", str(library_root),
+            "--dest", str(workdir / "raw"),
+            "--option", str(option_file),
+        )
+        assert code == EXIT_REFUSED
+        assert env["error"]["code"] == "RED_LINE"

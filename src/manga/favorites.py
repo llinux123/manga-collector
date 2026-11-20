@@ -5,7 +5,9 @@ Syncthing 共享区（``Export\\Manga``），所以导出落点必须过红线�
 
 **凭据**：
 * 账号密码走 jmcomic 的 ``auth``（option 文件 / 环境变量），本模块不碰；
-* zip 密码只从**环境变量**读（``MANGA_ZIP_PASSWORD``），**绝不回显、绝不写进信封**。
+* zip 密码只从**环境变量**读（``MANGA_ZIP_PASSWORD``），**绝不回显、绝不写进信封**；
+* 加密打包**进程内**完成（pyzipper AES-256）——上游插件的加密路径会把密码
+  拼进 shell 命令并写日志，本项目绝不调用它（P0 修复）。
 
 ⚠ 收藏夹与签到都**需要登录态**。没有登录态时 jmcomic 会在调用时抛错 ——
 本模块把它翻译成退出码 3（需要凭据），让 agent 知道该去配 ``auth`` 而不是干等。
@@ -90,13 +92,16 @@ def export_favorites(
         from jmcomic.jm_plugin import FavoriteFolderExportPlugin
 
         plugin = FavoriteFolderExportPlugin.build(option)
+        # ⚠ P0：绝不让上游做 zip —— 它的加密路径把 `-p<密码>` 拼进 shell 命令
+        # （subprocess.run(shell=True)）并完整写日志 → 密码进 stderr/日志/进程命令行。
+        # CSV 导出照旧走上游；打包一律在本进程内完成（见 _zip_in_process）。
         plugin.invoke(
             save_dir=str(dest),
-            zip_enable=zip_enable,
+            zip_enable=False,
             # 上游插件**无条件**对 zip_filepath 做 os.path.abspath() → 传 None 会 TypeError，
             # 所以即使不要 zip 也要给一个合法路径
             zip_filepath=str(zip_filepath),
-            zip_password=zip_password,
+            zip_password=None,
             delete_original_file=False,
             max_retry=max_retry,
         )
@@ -108,6 +113,9 @@ def export_favorites(
     files = [str(f) for f in getattr(plugin, "files", []) or []]
     failed_folders = [str(f) for f in getattr(plugin, "failed_folders", []) or []]
 
+    if zip_enable:
+        _zip_in_process(files, Path(zip_filepath), password=zip_password)
+
     return {
         "dest": str(dest),
         "file_count": len(files),
@@ -117,6 +125,51 @@ def export_favorites(
         "zip": str(zip_filepath) if (zip_enable and zip_filepath) else None,
         "zip_encrypted": bool(zip_enable and zip_password),
     }
+
+
+def _pyzipper():
+    """延迟导入 pyzipper；没装返回 None（调用方翻译成 DEP_MISSING，绝不自动装）。"""
+    try:
+        import pyzipper
+
+        return pyzipper
+    except ImportError:
+        return None
+
+
+def _zip_in_process(files: list[str], zip_path: Path, *, password: str | None) -> None:
+    """进程内打包本次导出的文件。
+
+    * 有密码 → pyzipper AES-256（WZ_AES）；密码只存在于内存与 zip 头，
+      不进命令行、不进日志、不起子进程。
+    * 无密码 → 标准库 zipfile。
+    * 只打包 ``files``（本次成功导出的清单），不扫整个目录 ——
+      避免把上一轮遗留或写了一半的 csv 混进包里。
+    """
+    if not files:
+        return
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    if password:
+        pyzipper = _pyzipper()
+        if pyzipper is None:
+            raise MangaError(
+                "加密 zip 缺少可选依赖：pyzipper",
+                code="DEP_MISSING",
+                exit_code=4,
+                hint="uv pip install pyzipper（CLI 不会自动安装）",
+            )
+        with pyzipper.AESZipFile(
+            zip_path, "w", compression=pyzipper.ZIP_DEFLATED, encryption=pyzipper.WZ_AES
+        ) as zf:
+            zf.setpassword(password.encode("utf-8"))
+            for f in files:
+                zf.write(f, arcname=Path(f).name)
+    else:
+        import zipfile
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                zf.write(f, arcname=Path(f).name)
 
 
 def checkin(option) -> dict[str, Any]:

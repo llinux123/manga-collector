@@ -122,9 +122,113 @@ class TestZipPassword:
             dest=workdir / "fav",
             zip_enable=True,
         )
-        assert captured["zip_password"] == "s3cret-value"
+        # P0 修复：上游插件绝不能拿到密码或 zip_enable=True（它会拼 shell 命令并写日志）
+        assert captured.get("zip_password") is None
+        assert captured.get("zip_enable") is False
         assert "s3cret-value" not in json.dumps(data, ensure_ascii=False)
         assert data["zip_encrypted"] is True
+
+
+class TestInProcessZip:
+    """P0 回归：加密打包必须进程内完成 —— 密码不进 shell、不进日志、不进 spawn 参数。"""
+
+    CANARY = "canary-pw-$(echo injected);&|`x`"
+
+    def _install_plugin(self, monkeypatch: pytest.MonkeyPatch, workdir: Path, captured: dict) -> None:
+        class _Plugin:
+            @classmethod
+            def build(cls, option):
+                return cls()
+
+            def invoke(self, **kwargs):
+                captured.update(kwargs)
+                save_dir = Path(kwargs["save_dir"])
+                save_dir.mkdir(parents=True, exist_ok=True)
+                csv = save_dir / "folder-1.csv"
+                csv.write_text("id,author,name\n1,a,t\n", encoding="utf-8")
+                self.files = [str(csv)]
+
+            files: list = []
+            failed_folders: list = []
+
+        import jmcomic.jm_plugin as jm_plugin
+
+        monkeypatch.setattr(jm_plugin, "FavoriteFolderExportPlugin", _Plugin)
+
+    def test_password_never_reaches_shell_or_logs(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+    ) -> None:
+        pyzipper = pytest.importorskip("pyzipper")
+        monkeypatch.setenv(favorites.ENV_ZIP_PASSWORD, self.CANARY)
+        captured: dict = {}
+        self._install_plugin(monkeypatch, workdir, captured)
+
+        spawned: list = []
+        import subprocess
+
+        real_run = subprocess.run
+
+        def spy_run(cmd, *args, **kwargs):
+            spawned.append(cmd)
+            return real_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", spy_run)
+        monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("加密打包不得起子进程"))
+        monkeypatch.setattr("os.system", lambda cmd: pytest.fail(f"不得走 shell：{cmd}"))
+
+        data = favorites.export_favorites(
+            _FakeOption(username="u", password="p"),
+            dest=workdir / "fav",
+            zip_enable=True,
+        )
+        out = capsys.readouterr()
+        blob = json.dumps(data, ensure_ascii=False) + out.out + out.err + repr(spawned) + repr(captured)
+        assert self.CANARY not in blob, "密码出现在了输出/日志/spawn 参数里"
+        assert data["zip_encrypted"] is True
+
+        # 产物真的是 AES 加密 zip，且能用密码读回
+        zip_path = Path(data["zip"])
+        assert zip_path.is_file()
+        with pyzipper.AESZipFile(zip_path) as zf:
+            zf.setpassword(self.CANARY.encode("utf-8"))
+            names = zf.namelist()
+            assert "folder-1.csv" in names
+            assert b"id,author,name" in zf.read("folder-1.csv")
+
+    def test_missing_pyzipper_gives_dep_missing(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(favorites.ENV_ZIP_PASSWORD, "pw")
+        captured: dict = {}
+        self._install_plugin(monkeypatch, workdir, captured)
+        monkeypatch.setattr(favorites, "_pyzipper", lambda: None)
+        with pytest.raises(MangaError) as excinfo:
+            favorites.export_favorites(
+                _FakeOption(username="u", password="p"),
+                dest=workdir / "fav",
+                zip_enable=True,
+            )
+        assert excinfo.value.code == "DEP_MISSING"
+        assert excinfo.value.exit_code == 4
+        assert "pyzipper" in (excinfo.value.hint or "")
+
+    def test_zip_without_password_stays_in_process(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """无密码 zip 也不走上游（统一进程内 zipfile），产物可读。
+
+        注：``export_favorites`` 的既有契约是 zip_enable=True 必须有密码；
+        这里直接测 ``_zip_in_process`` 的无密码分支（内部 API 允许 None）。
+        """
+        import zipfile
+
+        monkeypatch.delenv(favorites.ENV_ZIP_PASSWORD, raising=False)
+        csv = workdir / "folder-1.csv"
+        csv.write_text("id,author,name\n1,a,t\n", encoding="utf-8")
+        zip_path = workdir / "plain.zip"
+        favorites._zip_in_process([str(csv)], zip_path, password=None)
+        with zipfile.ZipFile(zip_path) as zf:
+            assert "folder-1.csv" in zf.namelist()
 
 
 class TestCli:

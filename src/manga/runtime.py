@@ -53,7 +53,7 @@ def finish_plugins(option: Any) -> list[str]:
 OPTIONAL_DEPENDENCIES: tuple[tuple[str, str, str], ...] = (
     ("img2pdf", "img2pdf", "export --format pdf"),
     ("PIL", "pillow", "export --format longimg"),
-    ("pyzipper", "pyzipper", "export 加密 zip"),
+    ("pyzipper", "pyzipper", "favorites --zip（进程内 AES 加密）/ export 加密 zip"),
     ("py7zr", "py7zr", "export 7z 加密 zip"),
     ("pikepdf", "pikepdf", "export 加密 pdf"),
 )

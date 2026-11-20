@@ -19,8 +19,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -61,6 +63,10 @@ EXPORT_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "pdf": ("img2pdf",),
     "longimg": ("PIL",),
 }
+
+#: 车号 sidecar 文件名：下载成功后写进每本目录，供 Convert/Ingest 读取，
+#: 最终落到 ComicInfo 的 ``<Notes>jm:<id></Notes>`` 与 ``<Web>``。
+ALBUM_SIDECAR_NAME = ".jm-album.json"
 
 #: 导入名 → pip 包名（提示用）
 _PIP_NAMES: dict[str, str] = {
@@ -236,7 +242,118 @@ def build_option(
         ensure_safe_dest(dest, export_dir=export_dir, library_dir=library_dir)
         option.dir_rule.base_dir = str(dest)
 
+    # P0：插件的独立输出目录也要过红线 —— 只覆盖 base_dir 挡不住
+    # zip/img2pdf/long_img/download_cover 这类自带落点参数的插件。
+    validate_option_plugins(option, export_dir=export_dir, library_dir=library_dir)
+
     return option
+
+
+# ── 插件红线闸门（P0） ─────────────────────────────────────────────────────
+
+#: 灰色来源下允许使用的插件白名单。
+#: 入选标准：不写文件，或输出目录可被下面的键表完整校验。
+#: 不在名单里的插件（可能写文件、改路径解析函数、起服务端）一律拒绝 ——
+#: 宁可误拒，不可漏放（红线是最高优先级）。
+PLUGIN_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "advanced_retry",          # 只改重试策略
+        "login",                   # 只登录
+        "usage_log",               # 只打日志
+        "log_topic_filter",        # 只过滤日志
+        "client_proxy",            # 只改代理
+        "image_suffix_filter",     # 只过滤图片后缀
+        "skip_photo_with_few_images",  # 只跳过章节
+        "find_update",             # 只查更新（不下载）
+        "download_progress",       # 只报进度
+        "zip",                     # 输出目录可校验（zip_dir / dir_rule）
+        "img2pdf",                 # 输出目录可校验（pdf_dir / dir_rule）
+        "long_img",                # 输出目录可校验（img_dir / dir_rule）
+        "download_cover",          # 输出目录可校验（dir_rule）
+        "calibre_metadata",        # 输出目录可校验（dir_rule）
+        "delete_duplicated_files", # 只在 base_dir（已被 CLI 强制）内去重
+    }
+)
+
+#: 插件 kwargs 里已知的「输出目录」键（含嵌套 dir_rule dict 的 base_dir）。
+_PLUGIN_DIR_KEYS: frozenset[str] = frozenset(
+    {"zip_dir", "pdf_dir", "img_dir", "output_dir", "save_dir", "cover_dir", "base_dir"}
+)
+
+
+def validate_option_plugins(
+    option,
+    *,
+    export_dir: Path | None = None,
+    library_dir: Path | None = None,
+) -> None:
+    """校验 option 里所有插件：白名单 + 输出目录红线。
+
+    * 插件不在 :data:`PLUGIN_ALLOWLIST` → 拒绝（exit 6），提示改用白名单插件；
+    * 插件 kwargs 里的已知输出目录键（含嵌套 ``dir_rule.base_dir``）逐一
+      resolve 后过 :func:`ensure_safe_dest`，命中共享区/权威库即拒绝。
+
+    在**构造 option 阶段**调用（build_option 末尾）—— 早于任何下载/插件执行。
+    """
+    plugins = _safe(lambda: option.plugins, None)
+    if plugins is None:
+        return
+    src = _safe(lambda: plugins.src_dict, None)
+    if not isinstance(src, dict):
+        src = dict(plugins) if hasattr(plugins, "keys") else {}
+
+    for group, plist in src.items():
+        if not isinstance(plist, list):
+            continue  # dependencies_strategy / valid 等标量配置
+        for pinfo in plist:
+            if not isinstance(pinfo, dict):
+                continue
+            key = str(pinfo.get("plugin", ""))
+            if key not in PLUGIN_ALLOWLIST:
+                raise RedLineViolation(
+                    f"红线：插件 [{key}]（{group}）不在灰色来源白名单内 —— "
+                    "它可能写文件或改写路径，无法保证产物不进共享区/权威库",
+                    data={
+                        "plugin": key,
+                        "group": group,
+                        "allowlist": sorted(PLUGIN_ALLOWLIST),
+                    },
+                )
+            kwargs = pinfo.get("kwargs") or {}
+            if isinstance(kwargs, dict):
+                _check_plugin_dirs(key, group, kwargs, export_dir=export_dir, library_dir=library_dir)
+
+
+def _check_plugin_dirs(
+    key: str,
+    group: str,
+    kwargs: dict,
+    *,
+    export_dir: Path | None,
+    library_dir: Path | None,
+    prefix: str = "",
+) -> None:
+    """递归检查插件 kwargs 里的输出目录键。"""
+    for k, v in kwargs.items():
+        path_label = f"{prefix}{k}"
+        if isinstance(v, dict):
+            _check_plugin_dirs(
+                key, group, v, export_dir=export_dir, library_dir=library_dir, prefix=f"{path_label}."
+            )
+            continue
+        if k in _PLUGIN_DIR_KEYS and isinstance(v, str) and v.strip():
+            target = Path(v).expanduser()
+            try:
+                target = target.resolve()
+            except OSError:
+                continue
+            try:
+                ensure_safe_dest(target, export_dir=export_dir, library_dir=library_dir)
+            except RedLineViolation as exc:
+                raise RedLineViolation(
+                    f"红线：插件 [{key}]（{group}）的输出参数 {path_label} 指向禁区：{v}",
+                    data={**(exc.data or {}), "plugin": key, "group": group, "kwarg": path_label},
+                ) from exc
 
 
 def make_client(option, *, impl: str | None = None, domain_list: Sequence[str] | None = None):
@@ -565,7 +682,18 @@ def download(
                 failures[target_id] = error
                 on_progress("failed", target_id, f"{type(error).__name__}: {error}")
                 continue
-            items.extend(list(result))
+            # P1 修复：check_exception=False 时上游把失败放进 BatchResult.failed，
+            # 绝不能因为有返回值就记 done —— 失败 ID 必须进 failures + failed 事件。
+            batch_failed = _safe(lambda: getattr(result, "failed", None), {}) or {}
+            entity_items = list(result)
+            if batch_failed:
+                first_error = next(iter(batch_failed.values()))
+                failures[target_id] = first_error
+                on_progress("failed", target_id, f"{type(first_error).__name__}: {first_error}")
+                # 失败批里仍可能混着成功的实体（部分成功），只收成功部分
+                items.extend(entity_items)
+                continue
+            items.extend(entity_items)
             on_progress("done", target_id, None)
 
     return _summarize(items, failures, dest=dest, kind=kind)
@@ -593,6 +721,67 @@ def _manifest_images(dler) -> list[str]:
     return paths
 
 
+def _album_id_of(entity: Any) -> str:
+    """从下载实体上取「本子车号」（章节实体则取所属本子 id）。"""
+    return str(
+        _safe(lambda: getattr(entity, "album_id", None))
+        or _safe(lambda: getattr(entity, "photo_id", None))
+        or ""
+    )
+
+
+def write_album_sidecars(items: list[Any], *, dest: Path) -> list[str]:
+    """为每个下载成功的本子目录写 ``.jm-album.json``（车号 sidecar）。
+
+    车号只在下载时拿得到（``dir_rule`` 的目录名里没有它），所以要在这里落一份，
+    让后面的 Convert / Ingest 能把它写进 ComicInfo。
+
+    * 目录从**实际写出的图片路径**反推（``<dest>/<本子>/<章节>/<图>`` 的第一段），
+      不靠标题拼路径 —— 标题里的非法字符会被上游 sanitize，按标题拼会错。
+    * best-effort：写失败不影响下载结果，只记录到返回值里。
+    """
+    dest = Path(dest)
+    written: list[str] = []
+    for item in items:
+        try:
+            album, dler = item
+        except (TypeError, ValueError):  # pragma: no cover - 上游返回形态变化
+            continue
+        album_id = _album_id_of(album)
+        if not album_id:
+            continue
+        paths = _manifest_images(dler)
+        if not paths:
+            continue
+        album_dir: Path | None = None
+        for p in paths:
+            try:
+                rel = Path(p).resolve().relative_to(dest.resolve())
+            except (ValueError, OSError):
+                continue
+            # 两层及以上（<本子>/<章节>/<图>）才能从第一段认出「本子目录」
+            if len(rel.parts) >= 3:
+                album_dir = dest / rel.parts[0]
+                break
+        if album_dir is None:
+            continue
+        payload = {
+            "schema": 1,
+            "source": "jmcomic",
+            "album_id": album_id,
+            "title": _safe(lambda: album.name) or "",
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        try:
+            album_dir.mkdir(parents=True, exist_ok=True)
+            sidecar = album_dir / ALBUM_SIDECAR_NAME
+            sidecar.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            written.append(str(sidecar))
+        except OSError:
+            continue
+    return written
+
+
 def _collect_download(result, *, dest: Path, kind: str) -> dict[str, Any]:
     """把 jmcomic 的下载结果整理成稳定的 dict。"""
     failed = dict(_safe(lambda: getattr(result, "failed", None), {}) or {})
@@ -613,6 +802,13 @@ def _summarize(
     """
     succeeded: list[dict[str, Any]] = []
     files: list[str] = []
+
+    # 先把车号 sidecar 写进每本目录（best-effort；失败不影响下载结果）
+    # 章节（photo）模式下实体上的 id 是章节 id，语义不同，不写。
+    try:
+        sidecars = write_album_sidecars(items, dest=dest) if kind == "album" else []
+    except Exception:  # noqa: BLE001 - 落 sidecar 属附赠信息，绝不能拖垮下载
+        sidecars = []
 
     for item in items:
         try:
@@ -643,6 +839,7 @@ def _summarize(
         # 只给样本：120 条路径会把 agent 的上下文冲爆（每本子 ≤ 30 次调用是硬指标）
         "files": files[:20],
         "files_truncated": len(files) > 20,
+        "album_sidecars": sidecars,
     }
 
 

@@ -235,6 +235,50 @@ def download(
 
     stats, unreadable = _comicinfo_stats(produced)
 
+    # P1：产物在，但退出码非 0 → **部分失败**。
+    #
+    # mangadex-dl 遇到某些章节失败会「写完能写的、退出码非 0」——此前一律报 ok，
+    # agent 会以为整本下好了，缺章的 CBZ 之后一路走进库闸门（页数 ≥ 5 就算达标）。
+    if proc.returncode != 0:
+        detail = _tail(stderr) or _tail(stdout) or f"退出码 {proc.returncode}"
+        raise MangaError(
+            f"mangadex-dl 退出码 {proc.returncode}（产物已写出，但过程有错误）",
+            code="DOWNLOAD_FAILED",
+            exit_code=EXIT_ERROR,
+            hint=detail or None,
+            data={
+                "dest": str(dest),
+                "url": url,
+                "exit_code": proc.returncode,
+                "files": produced,
+                "stderr": detail,
+            },
+        )
+
+    # P1：产物里有读不动的 CBZ（不是合法 zip）→ 坏包必须在这一层拦下，
+    # 否则它会以「零字节/打不开」的形式混进库里。
+    if unreadable:
+        raise MangaError(
+            f"mangadex-dl 产出 {len(unreadable)} 个读不动的 CBZ（损坏包）",
+            code="CORRUPT_ARTIFACT",
+            exit_code=EXIT_ERROR,
+            hint="删掉这些文件后重跑同一条命令即可重新下载",
+            data={
+                "dest": str(dest),
+                "url": url,
+                "unreadable": unreadable[:20],
+                "unreadable_count": len(unreadable),
+                "files": produced,
+            },
+        )
+
+    warnings: list[str] = []
+    if stats["without"]:
+        warnings.append(
+            f"{stats['without']} 个 CBZ 里没有 ComicInfo.xml —— 入库闸门会判不合规，"
+            "先补元数据再入库"
+        )
+
     return {
         "dest": str(dest),
         "url": url,
@@ -247,6 +291,7 @@ def download(
         "changed_files": changed_files,
         "comicinfo": stats,
         "comicinfo_unreadable": unreadable,
+        "warnings": warnings,
         "exit_code": proc.returncode,
         "stdout_tail": _tail(stdout),
         "stderr_tail": _tail(stderr),
